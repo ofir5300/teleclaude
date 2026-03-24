@@ -60,7 +60,7 @@ The technical pattern is sometimes called **reflexive software** or **agentic bo
 pip install teleclaude
 ```
 
-### Create your bot (30 lines)
+### Create your bot
 
 ```python
 import os
@@ -75,37 +75,36 @@ bot = TeleClaudeBot(
     token=os.environ["TELEGRAM_BOT_TOKEN"],
     chat_id=os.environ["TELEGRAM_CHAT_ID"],
     claude_session=session,
-    bot_name="MyBot",
 )
 bot.run()
 ```
 
-That's it. You now have these commands in Telegram:
+That's it. Send any message in Telegram and Claude Code responds. Built-in commands:
 
-| Command          | What it does                                      |
-| ---------------- | ------------------------------------------------- |
-| `/claude <text>` | Send a read-only prompt to Claude Code            |
-| `/approve`       | Execute Claude's pending plan (allows file edits) |
-| `/reject`        | Discard the pending plan                          |
-| `/restart`       | Restart the bot process (picks up code changes)   |
+| Command     | What it does                                      |
+| ----------- | ------------------------------------------------- |
+| Free text   | Chat with Claude Code (read-only mode)            |
+| `/approve`  | Execute Claude's pending plan (allows file edits) |
+| `/reject`   | Discard the pending plan                          |
+| `/restart`  | Restart the bot process (picks up code changes)   |
 
 ### Add your own commands
 
 ```python
 class MyBot(TeleClaudeBot):
+    def extra_commands(self):
+        return [("improve", "Ask Claude to improve this bot", self.cmd_improve)]
+
+    async def cmd_improve(self, update, context):
+        # Ask Claude for a plan (read-only), then show it for approval
+        plan = await self._run_claude_async("Suggest one improvement to main.py.")
+        await self.send_plan_for_approval(update, plan, "Implement the improvement.")
+
     async def on_message(self, update, text):
-        """Handle free-text messages - add your domain logic here."""
         if "deploy" in text:
-            await update.message.reply_text("Triggering deploy...")
-            # your deploy logic
+            await update.message.reply_text("Deploying...")
         else:
             await self._route_to_claude(update, text)
-
-    def extra_commands(self):
-        return [("status", "Show system status", self.cmd_status)]
-
-    async def cmd_status(self, update, context):
-        await update.message.reply_text("All systems operational.")
 ```
 
 ## Session modes
@@ -129,7 +128,7 @@ Stub for the upcoming Anthropic SDK channel API. Same interface as CLI mode - sw
 teleclaude/
   session_cli.py      # Claude Code subprocess wrapper with session persistence
   session_channel.py  # Channel API stub (same interface, future)
-  base_bot.py         # Telegram base class: /claude, /approve, /reject, /restart
+  base_bot.py         # Telegram base class: /approve, /reject, /restart + free-text routing
   self_update.py      # PID file management + os.execv restart
 ```
 

@@ -31,14 +31,15 @@ class TeleClaudeBot:
     """Base Telegram bot with built-in Claude Code integration.
 
     Built-in commands:
-        /claude <text>   - Send a read-only prompt to Claude
         /approve         - Execute Claude's pending plan
         /reject          - Discard pending plan
         /restart         - Restart the bot process
         /help            - Show commands
 
+    Free-text messages are automatically routed to Claude in read-only mode.
+
     Subclass and override:
-        on_message(update, text)   - Handle non-command, non-Claude messages
+        on_message(update, text)   - Handle free-text messages (default: route to Claude)
         on_callback(update, data)  - Handle custom inline keyboard callbacks
         extra_commands()           - Return list of (name, description, handler) tuples
         help_text()                - Return custom help string
@@ -88,7 +89,7 @@ class TeleClaudeBot:
         """Override to customize help message."""
         lines = [
             f"*{self.bot_name} Commands*\n",
-            "/claude `<text>` - Ask Claude Code",
+            "Send any message to chat with Claude Code",
             "/approve - Execute Claude's pending plan",
             "/reject - Discard pending plan",
             "/restart - Restart the bot",
@@ -102,15 +103,6 @@ class TeleClaudeBot:
 
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(self.help_text(), parse_mode="Markdown")
-
-    async def _cmd_claude(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not context.args:
-            await update.message.reply_text(
-                "Usage: /claude `<your question>`", parse_mode="Markdown"
-            )
-            return
-        prompt = " ".join(context.args)
-        await self._route_to_claude(update, prompt)
 
     async def _cmd_approve(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._claude_pending_prompt:
@@ -209,7 +201,6 @@ class TeleClaudeBot:
         # Built-in commands
         app.add_handler(CommandHandler("help", self._cmd_help))
         app.add_handler(CommandHandler("start", self._cmd_help))
-        app.add_handler(CommandHandler("claude", self._cmd_claude))
         app.add_handler(CommandHandler("approve", self._cmd_approve))
         app.add_handler(CommandHandler("reject", self._cmd_reject))
         app.add_handler(CommandHandler("restart", self._cmd_restart))
@@ -217,7 +208,6 @@ class TeleClaudeBot:
         # Extra commands from subclass
         commands = [
             BotCommand("help", "Show commands"),
-            BotCommand("claude", "Ask Claude Code"),
             BotCommand("approve", "Approve Claude's plan"),
             BotCommand("reject", "Reject Claude's plan"),
             BotCommand("restart", "Restart the bot"),

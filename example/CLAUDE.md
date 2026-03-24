@@ -19,7 +19,7 @@ python main.py
 ## Architecture
 - `main.py` - Entry point, subclass of `TeleClaudeBot`
 - `teleclaude.ClaudeSession` - Claude CLI subprocess wrapper (session persistence, plan/edit modes)
-- `teleclaude.TeleClaudeBot` - Telegram base class with /claude, /approve, /reject, /restart
+- `teleclaude.TeleClaudeBot` - Telegram base class with /approve, /reject, /restart + free-text routing
 - `teleclaude.self_update` - PID file management + `os.execv` restart
 
 ## Session management
