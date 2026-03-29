@@ -2,6 +2,7 @@
 
 Two modes: plan (read-only analysis) and edit (file modifications).
 Session IDs are persisted to disk and resumed with --resume for multi-turn context.
+Supports named sessions, pinned SSOT semantics, stream-json parsing, and handoff bootstrap.
 """
 
 import json
@@ -9,6 +10,7 @@ import logging
 import os
 import subprocess
 from pathlib import Path
+from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
 
@@ -24,14 +26,28 @@ class ClaudeSession:
         session = ClaudeSession(project_dir="/path/to/repo")
         plan = session.run("Analyze this code", allow_edits=False)
         result = session.run("Implement the plan", allow_edits=True)
+
+    Features:
+        - Session persistence with --resume
+        - Plan/edit permission modes
+        - Stream-json or json output format
+        - Named sessions with auto-incrementing counter
+        - Pinned SSOT session ID (never auto-overwritten)
+        - Handoff bootstrap (.handoff.md)
+        - Fallback callback when pinned session is unavailable
     """
 
     def __init__(
         self,
         project_dir: str,
         session_file: str | None = None,
-        last_session_file: str | None = None,
         model: str = "opus",
+        output_format: str = "json",
+        verbose: bool = False,
+        auto_pin: bool = True,
+        session_name_prefix: str | None = None,
+        bootstrap_file: str | None = None,
+        on_session_fallback: Optional[Callable[[str], None]] = None,
         plan_tools: list[str] | None = None,
         edit_tools: list[str] | None = None,
         plan_max_turns: int = 10,
@@ -41,27 +57,39 @@ class ClaudeSession:
         self.session_file = session_file or os.path.join(
             self.project_dir, "logs", "claude_session.txt"
         )
-        self.last_session_file = last_session_file or os.path.join(
-            self.project_dir, ".claude", "last_session.md"
-        )
         self.model = model
+        self.output_format = output_format
+        self.verbose = verbose
+        self.auto_pin = auto_pin
+        self.bootstrap_file = bootstrap_file
+        self.on_session_fallback = on_session_fallback
         self.plan_tools = plan_tools or PLAN_TOOLS
         self.edit_tools = edit_tools or EDIT_TOOLS
         self.plan_max_turns = plan_max_turns
         self.edit_max_turns = edit_max_turns
 
+        # Session naming
+        self._session_name_prefix = session_name_prefix
+        logs_dir = str(Path(self.session_file).parent)
+        self._session_name_file = os.path.join(logs_dir, "claude_session_name.txt")
+        self._counter_file = os.path.join(logs_dir, "telegram_session_counter.txt")
+
+        # Session state
         self._session_id: str | None = None
+        self._pinned_session_id: str | None = None
+        self._session_name: str | None = None
+
         self._load_session()
+        self._load_session_name()
 
     # -- Session persistence -----------------------------------------------
 
     def _load_session(self) -> str | None:
-        if self._session_id:
-            return self._session_id
         try:
             sid = Path(self.session_file).read_text().strip()
             if sid:
                 self._session_id = sid
+                self._pinned_session_id = sid
                 return sid
         except FileNotFoundError:
             pass
@@ -69,6 +97,7 @@ class ClaudeSession:
 
     def _save_session(self, sid: str):
         self._session_id = sid
+        self._pinned_session_id = sid
         Path(self.session_file).parent.mkdir(parents=True, exist_ok=True)
         Path(self.session_file).write_text(sid)
 
@@ -76,7 +105,108 @@ class ClaudeSession:
     def session_id(self) -> str | None:
         return self._session_id
 
-    # -- Core run ------------------------------------------------------
+    @property
+    def pinned_session_id(self) -> str | None:
+        return self._pinned_session_id
+
+    # -- Session naming ----------------------------------------------------
+
+    def _load_session_name(self) -> str | None:
+        try:
+            p = Path(self._session_name_file)
+            if p.exists():
+                name = p.read_text().strip()
+                if name:
+                    self._session_name = name
+                    return name
+        except Exception:
+            pass
+        return None
+
+    def _save_session_name(self, name: str):
+        self._session_name = name
+        try:
+            Path(self._session_name_file).parent.mkdir(parents=True, exist_ok=True)
+            Path(self._session_name_file).write_text(name)
+        except Exception:
+            pass
+
+    def _clear_session_name(self):
+        self._session_name = None
+        try:
+            Path(self._session_name_file).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    @property
+    def session_name(self) -> str | None:
+        return self._session_name
+
+    def next_session_name(self) -> str:
+        """Generate next session name like prefix-1, prefix-2, etc."""
+        prefix = self._session_name_prefix or "session"
+        counter = 0
+        try:
+            p = Path(self._counter_file)
+            if p.exists():
+                counter = int(p.read_text().strip())
+        except Exception:
+            pass
+        counter += 1
+        try:
+            Path(self._counter_file).parent.mkdir(parents=True, exist_ok=True)
+            Path(self._counter_file).write_text(str(counter))
+        except Exception:
+            pass
+        return f"{prefix}-{counter}"
+
+    # -- Output parsing ----------------------------------------------------
+
+    def _parse_json(self, result) -> tuple[str, str]:
+        """Parse --output-format json output."""
+        try:
+            data = json.loads(result.stdout or "{}")
+            return data.get("result", ""), data.get("session_id", "")
+        except json.JSONDecodeError:
+            return (result.stdout or "").strip(), ""
+
+    def _parse_stream_json(self, result) -> tuple[str, str]:
+        """Parse --output-format stream-json output.
+
+        stream-json emits one JSON object per line. We collect all assistant
+        text blocks and use the 'result' summary from the final 'result' line.
+        If 'result' is empty (e.g. Claude's last turn was a tool call), we
+        fall back to the last non-empty assistant text block.
+        """
+        texts = []
+        session_id = ""
+        final_result = ""
+        for line in (result.stdout or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg_type = d.get("type", "")
+            if msg_type == "assistant":
+                for block in d.get("message", {}).get("content", []):
+                    if block.get("type") == "text" and block.get("text", "").strip():
+                        texts.append(block["text"].strip())
+            elif msg_type == "result":
+                session_id = d.get("session_id", "")
+                final_result = (d.get("result", "") or "").strip()
+        # Prefer the result summary; fall back to last assistant text
+        response = final_result or (texts[-1] if texts else "")
+        return response, session_id
+
+    def _parse(self, result) -> tuple[str, str]:
+        if self.output_format == "stream-json":
+            return self._parse_stream_json(result)
+        return self._parse_json(result)
+
+    # -- Core run ----------------------------------------------------------
 
     def run(self, prompt: str, allow_edits: bool = False, timeout: int = 240) -> str:
         """Run claude CLI and return response text.
@@ -91,9 +221,13 @@ class ClaudeSession:
             Claude's response text.
         """
         base_cmd = [
-            "claude", "--print", "--output-format", "json",
+            "claude", "--print",
+            "--output-format", self.output_format,
             "--model", self.model,
         ]
+
+        if self.verbose:
+            base_cmd.append("--verbose")
 
         if allow_edits:
             base_cmd.extend(["--permission-mode", "acceptEdits"])
@@ -113,36 +247,64 @@ class ClaudeSession:
                 timeout=timeout, cwd=self.project_dir, env=env,
             )
 
-        def _parse(result):
-            try:
-                data = json.loads(result.stdout or "{}")
-                return data.get("result", ""), data.get("session_id", "")
-            except json.JSONDecodeError:
-                return (result.stdout or "").strip(), ""
-
-        # Try with existing session for context continuity
+        # ── Try with pinned / current session ──────────────────────────
         resumed = False
         if self._session_id:
             result = _run(base_cmd + ["--resume", self._session_id, "-p", prompt])
-            response_text, returned_session = _parse(result)
+            response_text, returned_session = self._parse(result)
 
             if result.returncode != 0 and not response_text:
-                log.warning("Session %s unavailable, starting fresh", self._session_id)
-                result = _run(base_cmd + ["-p", prompt])
-                response_text, returned_session = _parse(result)
+                # Session not found or expired — fall back to fresh
+                new_name = self.next_session_name() if self._session_name_prefix else None
+                if self.on_session_fallback and new_name:
+                    self.on_session_fallback(new_name)
+                elif self.on_session_fallback:
+                    self.on_session_fallback("")
+                else:
+                    log.warning("Session %s unavailable, starting fresh", self._session_id)
+
+                cmd_suffix = ["-p", prompt]
+                if new_name:
+                    cmd_suffix = ["--name", new_name] + cmd_suffix
+                    self._save_session_name(new_name)
+                result = _run(base_cmd + cmd_suffix)
+                response_text, returned_session = self._parse(result)
             else:
                 resumed = True
         else:
-            result = _run(base_cmd + ["-p", prompt])
-            response_text, returned_session = _parse(result)
+            # No pinned session — generate a name for the new session
+            new_name = self.next_session_name() if self._session_name_prefix else None
+            if new_name:
+                self._save_session_name(new_name)
 
-        # Persist session ID
+            # Check for handoff file to bootstrap context
+            actual_prompt = prompt
+            if self.bootstrap_file and Path(self.bootstrap_file).exists():
+                actual_prompt = (
+                    "Run /handoff read now — silently absorb .handoff.md context, "
+                    "then answer the user's message below.\n\n" + prompt
+                )
+
+            cmd_suffix = ["-p", actual_prompt]
+            if new_name:
+                cmd_suffix = ["--name", new_name] + cmd_suffix
+            result = _run(base_cmd + cmd_suffix)
+            response_text, returned_session = self._parse(result)
+
+        # ── Update session state ──────────────────────────────────────
         if returned_session:
             self._session_id = returned_session
-            # ASSUMPTION: auto-save session on first use and successful resume.
-            # For stricter pinning (never auto-overwrite), override _save_session.
-            if resumed or not Path(self.session_file).exists():
-                self._save_session(returned_session)
+
+            if self.auto_pin:
+                # Auto-save on first use and successful resume
+                if resumed or not Path(self.session_file).exists():
+                    self._save_session(returned_session)
+            else:
+                # Strict pinning: only save on first-ever or matching resume
+                if resumed and returned_session == self._pinned_session_id:
+                    self._save_session(returned_session)
+                elif not resumed and not self._pinned_session_id:
+                    self._save_session(returned_session)
 
         if result.returncode != 0 and not response_text:
             error_msg = (result.stderr or "unknown").strip()[:500]
@@ -152,22 +314,25 @@ class ClaudeSession:
 
     # -- Session management -----------------------------------------------
 
-    def flush(self, timeout: int = 120):
-        """Ask Claude to summarize context to last_session.md, then start fresh."""
+    def flush(self, flush_prompt: str | None = None, timeout: int = 240):
+        """Run a flush prompt (e.g. handoff write), then clear the session.
+
+        Args:
+            flush_prompt: Custom prompt to run before clearing. If None, skips.
+            timeout: Subprocess timeout.
+        """
         if not self._session_id:
             return
 
-        summary_prompt = (
-            f"Summarize the key context, decisions, and state from this conversation "
-            f"into {self.last_session_file}. Include: what was done, what's pending, "
-            f"and any important context for the next session."
-        )
-        try:
-            self.run(summary_prompt, allow_edits=True, timeout=timeout)
-        except Exception:
-            log.exception("Failed to flush session")
+        if flush_prompt:
+            try:
+                self.run(flush_prompt, allow_edits=True, timeout=timeout)
+            except Exception:
+                log.exception("Failed to flush session")
 
         self._session_id = None
+        self._pinned_session_id = None
+        self._clear_session_name()
         try:
             Path(self.session_file).unlink()
         except FileNotFoundError:
@@ -176,6 +341,8 @@ class ClaudeSession:
     def clear(self):
         """Clear session without flushing."""
         self._session_id = None
+        self._pinned_session_id = None
+        self._clear_session_name()
         try:
             Path(self.session_file).unlink()
         except FileNotFoundError:

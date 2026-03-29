@@ -1,22 +1,19 @@
 """Telegram bot base class with Claude Code plan/approve/reject workflow.
 
-Subclass TeleClaudeBot and override on_message() to add domain-specific logic.
+Sync implementation using raw requests (no python-telegram-bot dependency).
+Subclass TeleClaudeBot and override hooks to add domain-specific logic.
 """
 
-import asyncio
+import html as _html
+import json
 import logging
 import os
-from typing import Callable
-
-from telegram import Update, BotCommand
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Callable, Optional
 
 from teleclaude.session_cli import ClaudeSession
 from teleclaude.self_update import restart
@@ -27,226 +24,833 @@ log = logging.getLogger(__name__)
 _TG_MAX_LEN = 4000
 
 
+def _escape_html(text: str) -> str:
+    """Escape <, >, & so raw markdown/code doesn't break Telegram HTML parse_mode."""
+    return _html.escape(text, quote=False)
+
+
 class TeleClaudeBot:
     """Base Telegram bot with built-in Claude Code integration.
 
     Built-in commands:
-        /approve         - Execute Claude's pending plan
-        /reject          - Discard pending plan
-        /restart         - Restart the bot process
-        /help            - Show commands
+        /claude   - Claude Code menu (session, approve/reject, flush)
+        /session  - Session management (pin, clear)
+        /context  - Check Claude availability
+        /approve  - Execute Claude's pending plan
+        /reject   - Discard pending plan
+        /restart  - Restart the bot process
+        /help     - Show commands
 
     Free-text messages are automatically routed to Claude in read-only mode.
+    Voice messages are transcribed via Whisper and routed to Claude.
 
     Subclass and override:
-        on_message(update, text)   - Handle free-text messages (default: route to Claude)
-        on_callback(update, data)  - Handle custom inline keyboard callbacks
-        extra_commands()           - Return list of (name, description, handler) tuples
-        help_text()                - Return custom help string
+        domain_commands()           - Register domain-specific /commands
+        on_domain_callback(data, message_id) - Handle domain-specific callbacks
+        help_text()                 - Customize /help message
+        on_restart()                - Customize restart behavior
+        plan_prompt_wrapper(text)   - Customize the plan-mode prompt
     """
 
     def __init__(
         self,
-        token: str,
-        chat_id: str,
-        claude_session: ClaudeSession,
-        bot_name: str = "TeleClaudeBot",
+        token: str | None = None,
+        chat_id: str | None = None,
+        claude_session: ClaudeSession | None = None,
+        project_dir: str | None = None,
     ):
-        self.token = token
-        self.chat_id = chat_id
-        self.claude = claude_session
-        self.bot_name = bot_name
+        self.token = token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        self.chat_id = chat_id or os.environ.get("TELEGRAM_CHAT_ID", "")
+        self.base_url = f"https://api.telegram.org/bot{self.token}"
+        self.last_update_id = 0
+        self.running = False
+        self._seen_update_ids: set[int] = set()  # dedup Telegram re-deliveries
 
-        # Claude plan/approve state
-        self._claude_busy = False
+        self._last_message_text = ""
+        self._project_dir = project_dir or str(Path.cwd())
+
+        # Claude Code integration
+        self.claude = claude_session or ClaudeSession(project_dir=self._project_dir)
         self._claude_pending_prompt: str | None = None
+        self._claude_busy = False
 
-    # -- Hooks for subclasses ---------------------------------------------
+        # Context polling state
+        self._context_polling = False
+        self._context_poll_thread = None
 
-    async def on_message(self, update: Update, text: str):
-        """Override to handle free-text messages that aren't URLs or commands.
+        # Whisper model (lazy-loaded on first voice message)
+        self._whisper_model = None
 
-        Default: routes everything to Claude in read-only mode.
+        # Build command registry: built-in + domain commands
+        self.commands: dict[str, Callable] = {
+            "/claude": self._cmd_claude,
+            "/session": self._cmd_session,
+            "/context": self._cmd_context,
+            "/approve": self._cmd_approve,
+            "/reject": self._cmd_reject,
+            "/restart": self._cmd_restart,
+            "/help": self._cmd_help,
+            "/start": self._cmd_help,
+        }
+        for cmd, (handler, _desc) in self.domain_commands().items():
+            self.commands[cmd] = handler
+
+    # -- Extensibility hooks (override in subclass) ------------------------
+
+    def domain_commands(self) -> dict[str, tuple[Callable, str]]:
+        """Return {"/cmd": (handler, "description")} for domain-specific commands.
+
+        Example:
+            return {
+                "/status": (self._cmd_status, "Portfolio status"),
+                "/scan": (self._cmd_scan, "Find opportunities"),
+            }
         """
-        await self._route_to_claude(update, text)
+        return {}
 
-    async def on_callback(self, update: Update, data: str) -> bool:
-        """Override to handle custom inline keyboard callbacks.
-
-        Return True if handled, False to fall through to default handling.
-        """
+    def on_domain_callback(self, data: str, message_id: int) -> bool:
+        """Handle domain-specific callback_query data. Return True if handled."""
         return False
 
-    def extra_commands(self) -> list[tuple[str, str, Callable]]:
-        """Override to register additional commands.
-
-        Returns list of (command_name, description, async_handler) tuples.
-        Handler signature: async def handler(update, context)
-        """
-        return []
-
     def help_text(self) -> str:
-        """Override to customize help message."""
+        """Override to customize /help output."""
         lines = [
-            f"*{self.bot_name} Commands*\n",
-            "Send any message to chat with Claude Code",
-            "/approve - Execute Claude's pending plan",
-            "/reject - Discard pending plan",
+            "<b>Commands</b>",
+            "",
+            "<b>Claude Code</b>",
+            "/claude - Claude Code menu",
+            "/session - Session management",
+            "/context - Check availability",
+            "/approve - Approve pending action",
+            "/reject - Reject pending action",
             "/restart - Restart the bot",
             "/help - This message",
         ]
-        for name, desc, _ in self.extra_commands():
-            lines.append(f"/{name} - {desc}")
+        domain = self.domain_commands()
+        if domain:
+            lines.append("")
+            for cmd, (_handler, desc) in domain.items():
+                lines.append(f"{cmd} - {desc}")
+        lines.append("")
+        lines.append("Send any free text to chat with Claude Code.")
         return "\n".join(lines)
 
-    # -- Built-in command handlers -----------------------------------------
-
-    async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(self.help_text(), parse_mode="Markdown")
-
-    async def _cmd_approve(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._claude_pending_prompt:
-            await update.message.reply_text("No pending plan to approve.")
-            return
-        if self._claude_busy:
-            await update.message.reply_text("Claude is already working. Please wait.")
-            return
-
-        self._claude_busy = True
-        await update.message.reply_text("Approved! Claude is implementing...")
-
-        try:
-            response = await asyncio.to_thread(
-                self.claude.run, self._claude_pending_prompt, allow_edits=True
-            )
-            display = self._truncate(response)
-            await update.message.reply_text(
-                f"*Done!*\n\n{display}", parse_mode="Markdown"
-            )
-            self._claude_pending_prompt = None
-        except Exception as e:
-            log.exception("Claude edit failed")
-            await update.message.reply_text(f"Error: {e}")
-        finally:
-            self._claude_busy = False
-
-    async def _cmd_reject(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._claude_pending_prompt:
-            await update.message.reply_text("No pending plan to reject.")
-            return
-        self._claude_pending_prompt = None
-        await update.message.reply_text("Plan rejected.")
-
-    async def _cmd_restart(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("Restarting...")
+    def on_restart(self):
+        """Override to customize restart behavior. Default: os.execv restart."""
         restart()
 
-    # -- Claude routing ----------------------------------------------------
+    def plan_prompt_wrapper(self, user_text: str) -> str:
+        """Override to customize the prompt sent to Claude in plan mode."""
+        return (
+            f"The user sent this via Telegram: {user_text}\n\n"
+            "Analyze the request and respond concisely. "
+            "If a code change is needed, describe your plan (under 3000 chars). "
+            "They will send /approve to let you implement it."
+        )
 
-    async def _route_to_claude(self, update: Update, text: str):
-        """Send text to Claude in read-only mode and reply with the response."""
-        if self._claude_busy:
-            await update.message.reply_text("Claude is already working. Please wait.")
+    # -- Telegram HTTP methods ---------------------------------------------
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.token and self.chat_id)
+
+    def send(self, message: str) -> bool:
+        """Send a message. Tries HTML parse_mode first; falls back to plain text."""
+        if not self.is_configured:
+            return False
+        try:
+            url = f"{self.base_url}/sendMessage"
+            data = {
+                "chat_id": self.chat_id,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+            resp = __import__("requests").post(url, data=data, timeout=10)
+            if resp.status_code == 200:
+                return True
+            # HTML parse failed — retry without parse_mode
+            print(f"[!] Telegram HTML send failed ({resp.status_code}), retrying as plain text", flush=True)
+            data.pop("parse_mode")
+            resp2 = __import__("requests").post(url, data=data, timeout=10)
+            if resp2.status_code != 200:
+                print(f"[!] Telegram plain send also failed ({resp2.status_code}): {resp2.text[:300]}", flush=True)
+            return resp2.status_code == 200
+        except Exception as e:
+            print(f"[!] Telegram send failed: {e}", flush=True)
+            return False
+
+    def send_long(self, message: str, max_len: int = _TG_MAX_LEN) -> bool:
+        """Send a long message, splitting into multiple messages at newline boundaries."""
+        if len(message) <= max_len:
+            return self.send(message)
+
+        chunks = []
+        remaining = message
+        while remaining:
+            if len(remaining) <= max_len:
+                chunks.append(remaining)
+                break
+            cut = remaining.rfind("\n", 0, max_len)
+            if cut <= 0:
+                cut = max_len
+            chunks.append(remaining[:cut])
+            remaining = remaining[cut:].lstrip("\n")
+
+        ok = True
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                time.sleep(0.3)
+            if not self.send(chunk):
+                ok = False
+        return ok
+
+    def send_with_markup(self, message: str, reply_markup: dict) -> Optional[int]:
+        """Send a message with an inline keyboard. Returns message_id on success."""
+        if not self.is_configured:
+            return None
+        try:
+            import requests as _requests
+
+            url = f"{self.base_url}/sendMessage"
+            payload = {
+                "chat_id": self.chat_id,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+                "reply_markup": json.dumps(reply_markup),
+            }
+            resp = _requests.post(url, data=payload, timeout=10)
+            if resp.status_code == 200:
+                return resp.json().get("result", {}).get("message_id")
+            print(f"[!] Telegram send_with_markup failed ({resp.status_code}): {resp.text[:300]}", flush=True)
+        except Exception as e:
+            print(f"[!] Telegram send_with_markup failed: {e}", flush=True)
+        return None
+
+    def edit_message(self, message_id: int, text: str, reply_markup: dict = None) -> bool:
+        """Edit an existing message in-place (for inline keyboard drill-down)."""
+        if not self.is_configured:
+            return False
+        try:
+            import requests as _requests
+
+            url = f"{self.base_url}/editMessageText"
+            payload = {
+                "chat_id": self.chat_id,
+                "message_id": message_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+            if reply_markup:
+                payload["reply_markup"] = json.dumps(reply_markup)
+            resp = _requests.post(url, data=payload, timeout=10)
+            if resp.status_code != 200:
+                print(f"[!] Telegram edit_message failed ({resp.status_code}): {resp.text[:300]}", flush=True)
+            return resp.status_code == 200
+        except Exception as e:
+            print(f"[!] Telegram edit_message failed: {e}", flush=True)
+            return False
+
+    def answer_callback_query(self, callback_query_id: str) -> bool:
+        """Acknowledge a callback query (removes the loading spinner on the button)."""
+        try:
+            import requests as _requests
+
+            url = f"{self.base_url}/answerCallbackQuery"
+            resp = _requests.post(url, data={"callback_query_id": callback_query_id}, timeout=5)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def get_updates(self, timeout: int = 30) -> list:
+        """Get new messages from Telegram via long-polling."""
+        try:
+            import requests as _requests
+
+            url = f"{self.base_url}/getUpdates"
+            params = {
+                "offset": self.last_update_id + 1,
+                "timeout": timeout,
+                "allowed_updates": ["message", "callback_query"],
+            }
+            resp = _requests.get(url, params=params, timeout=timeout + 5)
+            if resp.status_code == 200:
+                return resp.json().get("result", [])
+        except Exception as e:
+            print(f"[!] Failed to get updates: {e}")
+        return []
+
+    # -- Polling infrastructure --------------------------------------------
+
+    def start_polling(self):
+        """Start listening for commands in a background daemon thread."""
+        self.running = True
+        self._register_commands()
+
+        def poll_loop():
+            print("[i] Telegram command listener started", flush=True)
+            while self.running:
+                try:
+                    updates = self.get_updates(timeout=30)
+                    if updates:
+                        print(f"[i] Telegram: {len(updates)} update(s) received", flush=True)
+                    for update in updates:
+                        try:
+                            self.process_update(update)
+                        except Exception as e:
+                            print(f"[!] Telegram command error: {e}", flush=True)
+                            try:
+                                self.send(f"❌ Command error: {e}")
+                            except Exception:
+                                pass
+                except Exception as e:
+                    print(f"[!] Telegram polling error: {e}", flush=True)
+                    time.sleep(5)
+
+        thread = threading.Thread(target=poll_loop, daemon=True)
+        thread.start()
+        return thread
+
+    def stop_polling(self):
+        """Stop listening for commands."""
+        self.running = False
+
+    def process_update(self, update: dict):
+        """Process a single update (message or callback_query)."""
+        uid = update.get("update_id")
+        if uid is not None:
+            if uid in self._seen_update_ids:
+                return  # Telegram re-delivery — skip
+            self._seen_update_ids.add(uid)
+            # Keep the set bounded; discard IDs older than last 200
+            if len(self._seen_update_ids) > 200:
+                self._seen_update_ids.discard(min(self._seen_update_ids))
+            self.last_update_id = uid
+
+        # Handle inline button presses
+        callback = update.get("callback_query")
+        if callback:
+            cb_chat_id = str(callback.get("message", {}).get("chat", {}).get("id", ""))
+            if cb_chat_id == self.chat_id:
+                self._handle_callback(callback)
             return
 
-        self._claude_busy = True
-        await update.message.reply_text("Thinking...")
+        message = update.get("message", {})
+        chat_id = str(message.get("chat", {}).get("id", ""))
+
+        # Only process messages from authorized chat
+        if chat_id != self.chat_id:
+            return
+
+        # Handle voice/audio messages
+        voice = message.get("voice") or message.get("audio")
+        if voice:
+            self._handle_voice_message(voice.get("file_id"))
+            return
+
+        text = message.get("text", "").strip()
+        if not text:
+            return  # Sticker, photo, reaction — ignore
+
+        # Store full message text for argument parsing
+        self._last_message_text = text
+
+        # Extract command or forward to Claude Code
+        if text.startswith("/"):
+            cmd = text.split()[0].lower()
+            if cmd in self.commands:
+                self.commands[cmd]()
+            else:
+                self.send(f"❓ Unknown command: {cmd}\nType /help for available commands")
+        else:
+            self._handle_claude_message(text)
+
+    def _handle_callback(self, callback: dict):
+        """Handle inline keyboard button presses."""
+        callback_id = callback.get("id", "")
+        data = callback.get("data", "")
+        message_id = callback.get("message", {}).get("message_id")
+
+        self.answer_callback_query(callback_id)
+
+        if not message_id:
+            return
+
+        # Claude menu callbacks handled by base class
+        if data.startswith("claude:"):
+            self._handle_claude_callback(data, message_id)
+            return
+
+        # Domain-specific callbacks handled by subclass
+        self.on_domain_callback(data, message_id)
+
+    def _register_commands(self):
+        """Register bot commands with Telegram (updates BotFather menu)."""
+        bot_commands = [
+            {"command": "claude", "description": "Claude Code menu"},
+            {"command": "session", "description": "Claude session management"},
+            {"command": "context", "description": "Context polling"},
+            {"command": "approve", "description": "Approve pending action"},
+            {"command": "reject", "description": "Reject pending action"},
+            {"command": "restart", "description": "Restart the bot process"},
+            {"command": "help", "description": "Show help message"},
+        ]
+        for cmd, (_handler, desc) in self.domain_commands().items():
+            bot_commands.append({"command": cmd.lstrip("/"), "description": desc})
 
         try:
-            response = await asyncio.to_thread(
-                self.claude.run, text, allow_edits=False
-            )
-            display = self._truncate(response)
-            await update.message.reply_text(display or "No response from Claude.")
+            import requests as _requests
+
+            url = f"{self.base_url}/setMyCommands"
+            resp = _requests.post(url, json={"commands": bot_commands}, timeout=10)
+            if resp.status_code == 200:
+                print("[i] Telegram bot commands registered", flush=True)
+            else:
+                print(f"[!] Failed to register commands: {resp.status_code}", flush=True)
         except Exception as e:
-            log.exception("Claude request failed")
-            await update.message.reply_text(f"Error: {e}")
-        finally:
-            self._claude_busy = False
+            print(f"[!] Failed to register commands: {e}", flush=True)
 
-    async def send_plan_for_approval(self, update: Update, plan_text: str, execute_prompt: str):
-        """Show a plan to the user and store the execute prompt for /approve.
+    # -- Generic command handlers ------------------------------------------
 
-        Call this from on_message() when you want the plan/approve flow.
-        """
-        self._claude_pending_prompt = execute_prompt
-        display = self._truncate(plan_text)
-        await update.message.reply_text(
-            f"*Claude's Plan:*\n\n{display}\n\n"
-            f"Use /approve to execute or /reject to cancel.",
-            parse_mode="Markdown",
+    def _cmd_help(self):
+        self.send(self.help_text())
+
+    def _cmd_restart(self):
+        self.send("🔄 Restarting...")
+        self.on_restart()
+
+    def _cmd_reject(self):
+        """Reject the pending Claude plan."""
+        if self._claude_pending_prompt:
+            self._claude_pending_prompt = None
+            self.send("🚫 Plan rejected.")
+        else:
+            self.send("ℹ️ No pending plan to reject.")
+
+    # -- Claude Code integration -------------------------------------------
+
+    def _handle_claude_message(self, text: str):
+        """Forward a free-text message to Claude Code for analysis/planning."""
+        if self._claude_busy:
+            self.send("⏳ Claude is still working on the previous request. Please wait.")
+            return
+
+        if self.claude.session_name:
+            status = f"session {self.claude.session_name}"
+        elif self.claude.session_id:
+            status = f"session …{self.claude.session_id[:8]}"
+        else:
+            status = "new session"
+        self.send(f"🧠 Asking Claude Code... ({status})")
+        self._claude_busy = True
+
+        def run_claude():
+            try:
+                plan_prompt = self.plan_prompt_wrapper(text)
+                # Bootstrap from .handoff.md is handled transparently by ClaudeSession
+                # whenever a new session starts — no extra logic needed here.
+                response = self.claude.run(plan_prompt, allow_edits=False, timeout=240)
+
+                if response and not response.startswith("Error:"):
+                    self._claude_pending_prompt = text
+                    self.send_long(f"🧠 <b>Claude's Plan:</b>\n\n{_escape_html(response)}")
+                    self.send("👆 /approve to implement, /reject to cancel")
+                elif response and response.startswith("Error:"):
+                    self.send(f"❌ {_escape_html(response)}")
+                    self._claude_pending_prompt = None
+                    # Auto-start context polling on rate limit
+                    if any(kw in response.lower() for kw in ("rate", "limit", "capacity")):
+                        self._start_context_polling()
+                else:
+                    self.send("🧠 Claude returned an empty response. Try again or rephrase your question.")
+                    self._claude_pending_prompt = None
+
+            except subprocess.TimeoutExpired:
+                self.send("⏰ Claude timed out (4min). Try a simpler request.")
+                self._claude_pending_prompt = None
+            except FileNotFoundError:
+                self.send("❌ <code>claude</code> CLI not found.")
+                self._claude_pending_prompt = None
+            except Exception as e:
+                self.send(f"❌ Claude error: {str(e)[:500]}")
+                self._claude_pending_prompt = None
+            finally:
+                self._claude_busy = False
+
+        thread = threading.Thread(target=run_claude, daemon=True)
+        thread.start()
+
+    def _cmd_approve(self):
+        """Approve and implement Claude's pending plan."""
+        if not self._claude_pending_prompt:
+            self.send("ℹ️ No pending plan to approve. Send a message first.")
+            return
+
+        if self._claude_busy:
+            self.send("⏳ Claude is already working.")
+            return
+
+        prompt = self._claude_pending_prompt
+        self._claude_pending_prompt = None
+        self._claude_busy = True
+        self.send("⚡ Implementing... Claude is writing code now.")
+
+        def run_implementation():
+            try:
+                impl_prompt = (
+                    f"The user APPROVED this plan via Telegram. Implement it now: {prompt}"
+                )
+                response = self.claude.run(impl_prompt, allow_edits=True, timeout=300)
+
+                if response and not response.startswith("Error:"):
+                    self.send_long(f"✅ <b>Done!</b>\n\n{_escape_html(response)}")
+                elif response and response.startswith("Error:"):
+                    self.send(f"❌ {_escape_html(response)}")
+                else:
+                    self.send("✅ Implementation complete (no output).")
+
+            except subprocess.TimeoutExpired:
+                self.send("⏰ Implementation timed out (5 min limit).")
+            except Exception as e:
+                self.send(f"❌ Implementation error: {str(e)[:500]}")
+            finally:
+                self._claude_busy = False
+
+        thread = threading.Thread(target=run_implementation, daemon=True)
+        thread.start()
+
+    # -- /claude interactive sub-menu --------------------------------------
+
+    def _cmd_claude(self):
+        """Show Claude Code interactive menu with inline keyboard."""
+        text, keyboard = self._build_claude_menu()
+        self.send_with_markup(text, keyboard)
+
+    def _build_claude_menu(self):
+        """Build the Claude Code main menu. Returns (text, keyboard)."""
+        status_icon = "🔴" if self._claude_busy else "🟢"
+        status_text = "Busy" if self._claude_busy else "Available"
+        polling_text = " | 📡 Polling for availability" if self._context_polling else ""
+
+        if self.claude.session_name:
+            sid_short = f"…{self.claude.pinned_session_id[:8]}" if self.claude.pinned_session_id else ""
+            session_line = f"📌 Session: <b>{self.claude.session_name}</b>" + (f" (<code>{sid_short}</code>)" if sid_short else "")
+        else:
+            sid_short = f"…{self.claude.pinned_session_id[:8]}" if self.claude.pinned_session_id else "none"
+            session_line = f"📌 Session: <code>{sid_short}</code>"
+
+        pending_text = ""
+        if self._claude_pending_prompt:
+            snippet = self._claude_pending_prompt[:50]
+            pending_text = f"\n📋 Pending plan: <i>{snippet}...</i>"
+
+        msg = (
+            f"<b>🧠 Claude Code</b> (CLI subprocess)\n"
+            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"{status_icon} Status: <b>{status_text}</b>{polling_text}\n"
+            f"{session_line}"
+            f"{pending_text}"
         )
 
-    # -- Callback query handler --------------------------------------------
+        buttons = []
+        buttons.append([{"text": "🔍 Check Availability", "callback_data": "claude:check"}])
 
-    async def _callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        handled = await self.on_callback(update, query.data)
-        if not handled:
-            await query.edit_message_text("Unknown action.")
+        if self._claude_pending_prompt:
+            buttons.append([
+                {"text": "✅ Approve Plan", "callback_data": "claude:approve"},
+                {"text": "🚫 Reject Plan", "callback_data": "claude:reject"},
+            ])
 
-    # -- Free-text handler -------------------------------------------------
+        buttons.append([{"text": "📌 Session Info", "callback_data": "claude:session"}])
+        buttons.append([{"text": "🔄 Flush & New Session", "callback_data": "claude:flush"}])
 
-    async def _free_text_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = update.message.text or ""
-        await self.on_message(update, text)
+        if self._context_polling:
+            buttons.append([{"text": "⏹ Stop Polling", "callback_data": "claude:poll_stop"}])
 
-    # -- Build & run -------------------------------------------------------
+        keyboard = {"inline_keyboard": buttons}
+        return msg.strip(), keyboard
 
-    def build(self) -> Application:
-        """Build the telegram Application with all handlers registered."""
-        app = Application.builder().token(self.token).build()
+    def _build_claude_session_view(self):
+        """Build session detail view. Returns (text, keyboard)."""
+        pinned = self.claude.pinned_session_id
+        active = self.claude.session_id
 
-        # Built-in commands
-        app.add_handler(CommandHandler("help", self._cmd_help))
-        app.add_handler(CommandHandler("start", self._cmd_help))
-        app.add_handler(CommandHandler("approve", self._cmd_approve))
-        app.add_handler(CommandHandler("reject", self._cmd_reject))
-        app.add_handler(CommandHandler("restart", self._cmd_restart))
+        msg = "<b>📌 Claude Code Session</b>\n\n"
+        if self.claude.session_name:
+            msg += f"🏷 Name: <b>{self.claude.session_name}</b>\n"
+        if pinned:
+            msg += f"📌 Pinned (SSOT): <code>{pinned}</code>\n"
+        else:
+            msg += "📌 Pinned: <i>none</i>\n"
+        if active and active != pinned:
+            msg += f"🔄 Active: <code>{active}</code>\n"
 
-        # Extra commands from subclass
-        commands = [
-            BotCommand("help", "Show commands"),
-            BotCommand("approve", "Approve Claude's plan"),
-            BotCommand("reject", "Reject Claude's plan"),
-            BotCommand("restart", "Restart the bot"),
+        msg += "\n<i>To pin a new session, send:</i>\n<code>/session pin &lt;session_id&gt;</code>"
+
+        buttons = [
+            [{"text": "🗑 Clear Session", "callback_data": "claude:session_clear"}],
+            [{"text": "⬅ Back to Claude Menu", "callback_data": "claude:menu"}],
         ]
-        for name, desc, handler in self.extra_commands():
-            app.add_handler(CommandHandler(name, handler))
-            commands.append(BotCommand(name, desc))
+        keyboard = {"inline_keyboard": buttons}
+        return msg.strip(), keyboard
 
-        # Callbacks and free text
-        app.add_handler(CallbackQueryHandler(self._callback_handler))
-        app.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self._free_text_handler)
+    def _handle_claude_callback(self, data: str, message_id: int):
+        """Handle claude:* inline button presses."""
+
+        if data == "claude:menu":
+            text, keyboard = self._build_claude_menu()
+            self.edit_message(message_id, text, keyboard)
+
+        elif data == "claude:check":
+            self.edit_message(message_id, "🔍 Checking Claude Code availability...")
+
+            def check_and_update():
+                try:
+                    env = {**os.environ}
+                    env.pop("CLAUDECODE", None)
+                    result = subprocess.run(
+                        ["claude", "--print", "--output-format", "json", "--max-turns", "1",
+                         "-p", "Reply with exactly: ok"],
+                        capture_output=True, text=True, timeout=30,
+                        cwd=self._project_dir, env=env,
+                    )
+                    if result.returncode == 0:
+                        status = "✅ Claude Code is <b>available</b>!"
+                    else:
+                        stderr = (result.stderr or "").strip()[:200]
+                        status = f"⏳ Claude Code <b>unavailable</b>\n<code>{stderr}</code>"
+                except subprocess.TimeoutExpired:
+                    status = "⏳ Claude Code <b>timed out</b> (may be rate-limited)"
+                except Exception as e:
+                    status = f"❌ Error: {str(e)[:200]}"
+
+                keyboard = {"inline_keyboard": [[{"text": "⬅ Back to Claude Menu", "callback_data": "claude:menu"}]]}
+                self.edit_message(message_id, status, keyboard)
+
+            threading.Thread(target=check_and_update, daemon=True).start()
+
+        elif data == "claude:approve":
+            if not self._claude_pending_prompt:
+                keyboard = {"inline_keyboard": [[{"text": "⬅ Back", "callback_data": "claude:menu"}]]}
+                self.edit_message(message_id, "ℹ️ No pending plan to approve.", keyboard)
+                return
+            self.edit_message(message_id, "⚡ Implementing... Claude is writing code now.")
+            self._cmd_approve()
+
+        elif data == "claude:reject":
+            self._claude_pending_prompt = None
+            text, keyboard = self._build_claude_menu()
+            self.edit_message(message_id, "🚫 Plan rejected.\n\n" + text, keyboard)
+
+        elif data == "claude:session":
+            text, keyboard = self._build_claude_session_view()
+            self.edit_message(message_id, text, keyboard)
+
+        elif data == "claude:session_clear":
+            self.claude.clear()
+            text, keyboard = self._build_claude_menu()
+            self.edit_message(message_id, "🗑 Session cleared.\n\n" + text, keyboard)
+
+        elif data == "claude:poll_stop":
+            self._context_polling = False
+            text, keyboard = self._build_claude_menu()
+            self.edit_message(message_id, text, keyboard)
+
+        elif data == "claude:flush":
+            self.edit_message(message_id, "🔄 Flushing session... generating summary from current session.")
+            self._flush_and_new_session(message_id)
+
+    def _flush_and_new_session(self, message_id: int):
+        """Flush current session context via /handoff write, then unpin."""
+        handoff_write_prompt = (
+            "Run /handoff write now. Write the handoff file to .handoff.md in the project root. "
+            "Be specific and concrete — a fresh session with zero context must act on this file alone."
         )
 
-        # Set commands on startup
-        chat_id = self.chat_id
-        bot_name = self.bot_name
+        def do_flush():
+            try:
+                self.edit_message(message_id, "🔄 Step 1/2: Writing session handoff...")
 
-        async def post_init(application: Application):
-            await application.bot.set_my_commands(commands)
-            log.info("%s started", bot_name)
-            await application.bot.send_message(
-                chat_id=chat_id,
-                text=f"*{bot_name} started*",
-                parse_mode="Markdown",
-            )
+                result = self.claude.run(handoff_write_prompt, allow_edits=True, timeout=240)
 
-        app.post_init = post_init
-        return app
+                handoff_path = Path(self._project_dir) / ".handoff.md"
+                if not handoff_path.exists():
+                    back_kb = {"inline_keyboard": [[{"text": "⬅ Back", "callback_data": "claude:menu"}]]}
+                    self.edit_message(message_id, f"❌ Handoff write failed — .handoff.md not created.\n{(result or '')[:300]}", back_kb)
+                    return
 
-    def run(self):
-        """Build and run the bot (blocking)."""
-        app = self.build()
-        app.run_polling(drop_pending_updates=True)
+                self.edit_message(message_id, "🔄 Step 2/2: Clearing session pin...")
+                self.claude.clear()  # ClaudeSession auto-bootstraps from .handoff.md on next message
 
-    # -- Helpers -----------------------------------------------------------
+                back_kb = {"inline_keyboard": [[{"text": "⬅ Claude Menu", "callback_data": "claude:menu"}]]}
+                self.edit_message(
+                    message_id,
+                    f"✅ <b>Session flushed!</b>\n\n"
+                    f"📝 Context saved to <code>.handoff.md</code>\n"
+                    f"🔄 Next message will start a new session with handoff context",
+                    back_kb,
+                )
 
-    @staticmethod
-    def _truncate(text: str, limit: int = _TG_MAX_LEN) -> str:
-        if len(text) <= limit:
-            return text
-        return text[: limit - 20] + "\n\n... (truncated)"
+            except Exception as e:
+                back_kb = {"inline_keyboard": [[{"text": "⬅ Back", "callback_data": "claude:menu"}]]}
+                self.edit_message(message_id, f"❌ Flush error: {str(e)[:300]}", back_kb)
+
+        threading.Thread(target=do_flush, daemon=True).start()
+
+    # -- /session command --------------------------------------------------
+
+    def _cmd_session(self):
+        """Show or manage the Claude Code session."""
+        parts = self._last_message_text.split()
+        if len(parts) >= 3 and parts[1].lower() == "pin":
+            new_id = parts[2].strip()
+            self.claude.pin(new_id)
+            self.send(f"📌 Pinned session: <code>{new_id[:12]}…</code>")
+            return
+        if len(parts) >= 2 and parts[1].lower() == "clear":
+            self.claude.clear()
+            self.send("🗑 Session cleared. Next message starts fresh.")
+            return
+
+        # Show session info
+        pinned = self.claude.pinned_session_id
+        active = self.claude.session_id
+        name = self.claude.session_name
+        msg = "<b>🧠 Claude Code Session</b>\n\n"
+        if name:
+            msg += f"🏷 Name: <b>{name}</b>\n"
+        if pinned:
+            msg += f"📌 Pinned (SSOT): <code>{pinned}</code>\n"
+        else:
+            msg += "📌 Pinned: <i>none</i>\n"
+        if active and active != pinned:
+            msg += f"🔄 Active: <code>{active}</code>\n"
+        msg += "\n<b>Commands:</b>"
+        msg += "\n<code>/session pin &lt;session_id&gt;</code> — pin a session"
+        msg += "\n<code>/session clear</code> — start fresh"
+        self.send(msg)
+
+    # -- /context and availability polling ---------------------------------
+
+    def _cmd_context(self):
+        """Check if Claude Code is available (not rate-limited)."""
+        self.send("🔍 Checking Claude Code availability...")
+
+        def check():
+            try:
+                env = {**os.environ}
+                env.pop("CLAUDECODE", None)
+                result = subprocess.run(
+                    ["claude", "--print", "--output-format", "json", "--max-turns", "1",
+                     "-p", "Reply with exactly: ok"],
+                    capture_output=True, text=True, timeout=30,
+                    cwd=self._project_dir, env=env,
+                )
+                if result.returncode == 0:
+                    self.send("✅ Claude Code is available!")
+                else:
+                    stderr = (result.stderr or "").strip()[:300]
+                    self.send(f"⏳ Claude Code unavailable.\n<code>{stderr}</code>")
+            except subprocess.TimeoutExpired:
+                self.send("⏳ Claude Code timed out (may be rate-limited).")
+            except Exception as e:
+                self.send(f"❌ Error checking: {str(e)[:200]}")
+
+        threading.Thread(target=check, daemon=True).start()
+
+    def _start_context_polling(self):
+        """Start background polling for Claude Code availability."""
+        if self._context_polling:
+            return
+
+        self._context_polling = True
+
+        def poll():
+            poll_interval = 300  # 5 minutes
+            max_duration = 12 * 3600  # 12 hours
+            start = time.time()
+
+            while self._context_polling and (time.time() - start) < max_duration:
+                time.sleep(poll_interval)
+                if not self._context_polling:
+                    break
+                try:
+                    env = {**os.environ}
+                    env.pop("CLAUDECODE", None)
+                    result = subprocess.run(
+                        ["claude", "--print", "--output-format", "json", "--max-turns", "1",
+                         "-p", "Reply with exactly: ok"],
+                        capture_output=True, text=True, timeout=30,
+                        cwd=self._project_dir, env=env,
+                    )
+                    if result.returncode == 0:
+                        self.send("🟢 <b>Claude Code is back online!</b> You can send messages now.")
+                        self._context_polling = False
+                        break
+                except Exception:
+                    pass
+
+            self._context_polling = False
+            self._context_poll_thread = None
+
+        self._context_poll_thread = threading.Thread(target=poll, daemon=True)
+        self._context_poll_thread.start()
+
+    # -- Voice message handling --------------------------------------------
+
+    def _handle_voice_message(self, file_id: str):
+        """Download and transcribe a Telegram voice message, then route to Claude."""
+        if not file_id:
+            self.send("Could not process voice message.")
+            return
+
+        self.send("Transcribing voice message...")
+
+        def transcribe():
+            try:
+                import requests as _requests
+
+                # Download the voice file from Telegram
+                file_info = _requests.get(f"{self.base_url}/getFile", params={"file_id": file_id}).json()
+                file_path = file_info.get("result", {}).get("file_path", "")
+                if not file_path:
+                    self.send("Failed to get voice file from Telegram.")
+                    return
+
+                download_url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
+                audio_data = _requests.get(download_url).content
+
+                with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+                    tmp.write(audio_data)
+                    tmp_path = tmp.name
+
+                # Lazy-load whisper model
+                if self._whisper_model is None:
+                    import whisper
+
+                    self._whisper_model = whisper.load_model("base")
+
+                result = self._whisper_model.transcribe(tmp_path)
+                text = result.get("text", "").strip()
+
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+                if not text:
+                    self.send("Could not transcribe audio (empty result).")
+                    return
+
+                self.send(f"Heard: <i>{text}</i>")
+                self._handle_claude_message(text)
+
+            except ImportError:
+                self.send("whisper not installed. Run: pip install openai-whisper")
+            except Exception as e:
+                self.send(f"Transcription error: {str(e)[:500]}")
+
+        thread = threading.Thread(target=transcribe, daemon=True)
+        thread.start()
