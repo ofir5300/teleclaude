@@ -278,8 +278,12 @@ class TeleClaudeBot:
             resp = _requests.get(url, params=params, timeout=timeout + 5)
             if resp.status_code == 200:
                 return resp.json().get("result", [])
+        except (ConnectionResetError, ConnectionError) as e:
+            # Transient network reset — normal for long-poll connections, just retry
+            time.sleep(2)
         except Exception as e:
             print(f"[!] Failed to get updates: {e}")
+            time.sleep(2)
         return []
 
     # -- Polling infrastructure --------------------------------------------
@@ -361,10 +365,13 @@ class TeleClaudeBot:
         if text.startswith("/"):
             cmd = text.split()[0].lower()
             if cmd in self.commands:
+                print(f"[cmd] {cmd} from user", flush=True)
                 self.commands[cmd]()
             else:
+                print(f"[cmd] Unknown command: {cmd}", flush=True)
                 self.send(f"❓ Unknown command: {cmd}\nType /help for available commands")
         else:
+            print(f"[claude] Free text received: \"{text[:80]}{'...' if len(text) > 80 else ''}\"", flush=True)
             self._handle_claude_message(text)
 
     def _handle_callback(self, callback: dict):
@@ -372,6 +379,7 @@ class TeleClaudeBot:
         callback_id = callback.get("id", "")
         data = callback.get("data", "")
         message_id = callback.get("message", {}).get("message_id")
+        print(f"[cb] Button pressed: {data}", flush=True)
 
         self.answer_callback_query(callback_id)
 
@@ -434,6 +442,7 @@ class TeleClaudeBot:
     def _handle_claude_message(self, text: str):
         """Forward a free-text message to Claude Code for analysis/planning."""
         if self._claude_busy:
+            print("[claude] Rejected — already busy", flush=True)
             self.send("⏳ Claude is still working on the previous request. Please wait.")
             return
 
@@ -443,6 +452,7 @@ class TeleClaudeBot:
             status = f"session …{self.claude.session_id[:8]}"
         else:
             status = "new session"
+        print(f"[claude] Sending to Claude (plan mode, {status})", flush=True)
         self.send(f"🧠 Asking Claude Code... ({status})")
         self._claude_busy = True
 
@@ -454,26 +464,32 @@ class TeleClaudeBot:
                 response = self.claude.run(plan_prompt, allow_edits=False, timeout=240)
 
                 if response and not response.startswith("Error:"):
+                    print(f"[claude] Plan received ({len(response)} chars)", flush=True)
                     self._claude_pending_prompt = text
                     self.send_long(f"🧠 <b>Claude's Plan:</b>\n\n{_escape_html(response)}")
                     self.send("👆 /approve to implement, /reject to cancel")
                 elif response and response.startswith("Error:"):
+                    print(f"[claude] Error: {response[:200]}", flush=True)
                     self.send(f"❌ {_escape_html(response)}")
                     self._claude_pending_prompt = None
                     # Auto-start context polling on rate limit
                     if any(kw in response.lower() for kw in ("rate", "limit", "capacity")):
                         self._start_context_polling()
                 else:
+                    print("[claude] Empty response from Claude", flush=True)
                     self.send("🧠 Claude returned an empty response. Try again or rephrase your question.")
                     self._claude_pending_prompt = None
 
             except subprocess.TimeoutExpired:
+                print("[claude] Timed out (4min)", flush=True)
                 self.send("⏰ Claude timed out (4min). Try a simpler request.")
                 self._claude_pending_prompt = None
             except FileNotFoundError:
+                print("[claude] CLI not found", flush=True)
                 self.send("❌ <code>claude</code> CLI not found.")
                 self._claude_pending_prompt = None
             except Exception as e:
+                print(f"[claude] Exception: {e}", flush=True)
                 self.send(f"❌ Claude error: {str(e)[:500]}")
                 self._claude_pending_prompt = None
             finally:
@@ -495,6 +511,7 @@ class TeleClaudeBot:
         prompt = self._claude_pending_prompt
         self._claude_pending_prompt = None
         self._claude_busy = True
+        print(f"[claude] Approved — implementing (edit mode)", flush=True)
         self.send("⚡ Implementing... Claude is writing code now.")
 
         def run_implementation():
@@ -505,15 +522,20 @@ class TeleClaudeBot:
                 response = self.claude.run(impl_prompt, allow_edits=True, timeout=300)
 
                 if response and not response.startswith("Error:"):
+                    print(f"[claude] Implementation complete ({len(response)} chars)", flush=True)
                     self.send_long(f"✅ <b>Done!</b>\n\n{_escape_html(response)}")
                 elif response and response.startswith("Error:"):
+                    print(f"[claude] Implementation error: {response[:200]}", flush=True)
                     self.send(f"❌ {_escape_html(response)}")
                 else:
+                    print("[claude] Implementation complete (no output)", flush=True)
                     self.send("✅ Implementation complete (no output).")
 
             except subprocess.TimeoutExpired:
+                print("[claude] Implementation timed out (5min)", flush=True)
                 self.send("⏰ Implementation timed out (5 min limit).")
             except Exception as e:
+                print(f"[claude] Implementation exception: {e}", flush=True)
                 self.send(f"❌ Implementation error: {str(e)[:500]}")
             finally:
                 self._claude_busy = False
@@ -736,6 +758,7 @@ class TeleClaudeBot:
 
     def _cmd_context(self):
         """Check if Claude Code is available (not rate-limited)."""
+        print("[context] Checking Claude availability: claude --print -p 'Reply with exactly: ok'", flush=True)
         self.send("🔍 Checking Claude Code availability...")
 
         def check():
@@ -749,13 +772,17 @@ class TeleClaudeBot:
                     cwd=self._project_dir, env=env,
                 )
                 if result.returncode == 0:
+                    print("[context] Claude is available (exit=0)", flush=True)
                     self.send("✅ Claude Code is available!")
                 else:
+                    print(f"[context] Claude unavailable (exit={result.returncode})", flush=True)
                     stderr = (result.stderr or "").strip()[:300]
                     self.send(f"⏳ Claude Code unavailable.\n<code>{stderr}</code>")
             except subprocess.TimeoutExpired:
+                print("[context] Claude timed out", flush=True)
                 self.send("⏳ Claude Code timed out (may be rate-limited).")
             except Exception as e:
+                print(f"[context] Check failed: {e}", flush=True)
                 self.send(f"❌ Error checking: {str(e)[:200]}")
 
         threading.Thread(target=check, daemon=True).start()
@@ -766,6 +793,7 @@ class TeleClaudeBot:
             return
 
         self._context_polling = True
+        print("[poll] Starting Claude availability polling (every 5min)", flush=True)
 
         def poll():
             poll_interval = 300  # 5 minutes
@@ -777,6 +805,7 @@ class TeleClaudeBot:
                 if not self._context_polling:
                     break
                 try:
+                    print("[poll] Checking Claude availability: claude --print -p 'Reply with exactly: ok'", flush=True)
                     env = {**os.environ}
                     env.pop("CLAUDECODE", None)
                     result = subprocess.run(
@@ -786,11 +815,14 @@ class TeleClaudeBot:
                         cwd=self._project_dir, env=env,
                     )
                     if result.returncode == 0:
+                        print("[poll] Claude is back online!", flush=True)
                         self.send("🟢 <b>Claude Code is back online!</b> You can send messages now.")
                         self._context_polling = False
                         break
-                except Exception:
-                    pass
+                    else:
+                        print(f"[poll] Still unavailable (exit={result.returncode})", flush=True)
+                except Exception as e:
+                    print(f"[poll] Check failed: {e}", flush=True)
 
             self._context_polling = False
             self._context_poll_thread = None

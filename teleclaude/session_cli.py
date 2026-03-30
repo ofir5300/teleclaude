@@ -242,6 +242,15 @@ class ClaudeSession:
         env.pop("CLAUDECODE", None)  # Allow nested claude invocation
 
         def _run(cmd):
+            # Log the command being executed (truncate prompt for readability)
+            cmd_display = []
+            for i, arg in enumerate(cmd):
+                if i > 0 and cmd[i - 1] == "-p" and len(arg) > 100:
+                    cmd_display.append(f"\"{arg[:100]}...\"")
+                else:
+                    cmd_display.append(arg)
+            log.info("Running: %s", " ".join(cmd_display))
+            print(f"[claude-cli] Running: {' '.join(cmd_display)}", flush=True)
             return subprocess.run(
                 cmd, capture_output=True, text=True,
                 timeout=timeout, cwd=self.project_dir, env=env,
@@ -255,6 +264,7 @@ class ClaudeSession:
 
             if result.returncode != 0 and not response_text:
                 # Session not found or expired — fall back to fresh
+                print(f"[claude-cli] Session {self._session_id[:12]}... expired, starting fresh", flush=True)
                 new_name = self.next_session_name() if self._session_name_prefix else None
                 if self.on_session_fallback and new_name:
                     self.on_session_fallback(new_name)
@@ -274,6 +284,7 @@ class ClaudeSession:
         else:
             # No pinned session — generate a name for the new session
             new_name = self.next_session_name() if self._session_name_prefix else None
+            print(f"[claude-cli] New session{f' (name={new_name})' if new_name else ''}", flush=True)
             if new_name:
                 self._save_session_name(new_name)
 
@@ -308,7 +319,10 @@ class ClaudeSession:
 
         if result.returncode != 0 and not response_text:
             error_msg = (result.stderr or "unknown").strip()[:500]
+            print(f"[claude-cli] Failed (exit={result.returncode}): {error_msg[:200]}", flush=True)
             response_text = f"Error: {error_msg}"
+        else:
+            print(f"[claude-cli] Finished (exit={result.returncode}, {len(response_text)} chars response)", flush=True)
 
         return response_text
 
