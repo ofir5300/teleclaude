@@ -26,7 +26,7 @@ Since it's an editable install, code changes in teleclaude are picked up immedia
 ## Conventions
 - Shared logic changes go here, not patched in individual bot repos
 - Both session approaches must expose the same interface (`run`, `flush`, `clear`, `pin`)
-- Keep `base_bot.py` extensible via hooks (`on_message`, `on_callback`, `extra_commands`)
+- Keep `base_bot.py` extensible via hooks (`domain_commands`, `on_domain_callback`, `help_text`, `on_restart`, `plan_prompt_wrapper`)
 
 ## Self-update flow
 1. Claude edits source files via `/approve`
