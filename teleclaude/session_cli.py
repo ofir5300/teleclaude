@@ -50,8 +50,8 @@ class ClaudeSession:
         on_session_fallback: Optional[Callable[[str], None]] = None,
         plan_tools: list[str] | None = None,
         edit_tools: list[str] | None = None,
-        plan_max_turns: int = 10,
-        edit_max_turns: int = 15,
+        plan_max_turns: int = 25,
+        edit_max_turns: int = 25,
     ):
         self.project_dir = str(Path(project_dir).resolve())
         self.session_file = session_file or os.path.join(
@@ -197,8 +197,9 @@ class ClaudeSession:
             elif msg_type == "result":
                 session_id = d.get("session_id", "")
                 final_result = (d.get("result", "") or "").strip()
-        # Prefer the result summary; fall back to last assistant text
-        response = final_result or (texts[-1] if texts else "")
+        # Prefer the result summary; fall back to all assistant text blocks joined
+        # (not just texts[-1] — Claude may split a single response across many blocks)
+        response = final_result or "\n\n".join(texts)
         return response, session_id
 
     def _parse(self, result) -> tuple[str, str]:
