@@ -411,12 +411,15 @@ class TeleClaudeBot:
         try:
             import requests as _requests
 
+            # Clear any manually-set BotFather commands first
+            _requests.post(f"{self.base_url}/deleteMyCommands", timeout=10)
+
             url = f"{self.base_url}/setMyCommands"
             resp = _requests.post(url, json={"commands": bot_commands}, timeout=10)
             if resp.status_code == 200:
-                print("[i] Telegram bot commands registered", flush=True)
+                print(f"[i] Telegram bot commands registered ({len(bot_commands)} commands)", flush=True)
             else:
-                print(f"[!] Failed to register commands: {resp.status_code}", flush=True)
+                print(f"[!] Failed to register commands: {resp.status_code} {resp.text[:200]}", flush=True)
         except Exception as e:
             print(f"[!] Failed to register commands: {e}", flush=True)
 
