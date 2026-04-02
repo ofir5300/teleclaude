@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from teleclaude.session_cli import ClaudeSession
+from teleclaude.session_cli import ClaudeSession, VALID_MODELS
 from teleclaude.self_update import restart
 
 log = logging.getLogger(__name__)
@@ -442,6 +442,20 @@ class TeleClaudeBot:
 
     # -- Claude Code integration -------------------------------------------
 
+    def _claude_stats_footer(self) -> str:
+        """Build a compact stats footer from the last Claude turn."""
+        s = self.claude.stats
+        if s.total_turns == 0:
+            return ""
+        parts = [f"💰 ${s.total_cost_usd:.3f}", f"⏱ {s.total_duration_ms / 1000:.1f}s"]
+        pct = self.claude.context_pct
+        if pct is not None:
+            parts.append(f"📊 {pct:.0f}%")
+        footer = "\n\n<i>" + " · ".join(parts) + "</i>"
+        if pct is not None and pct > 85:
+            footer += "\n⚠️ <i>Context {:.0f}% full — consider flushing session</i>".format(pct)
+        return footer
+
     def _handle_claude_message(self, text: str):
         """Forward a free-text message to Claude Code for analysis/planning."""
         if self._claude_busy:
@@ -456,7 +470,7 @@ class TeleClaudeBot:
         else:
             status = "new session"
         print(f"[claude] Sending to Claude (plan mode, {status})", flush=True)
-        self.send(f"🧠 Asking Claude Code... ({status})")
+        self.send(f"🧠 Asking Claude Code ({self.claude.model})... ({status})")
         self._claude_busy = True
 
         def run_claude():
@@ -470,7 +484,7 @@ class TeleClaudeBot:
                     print(f"[claude] Plan received ({len(response)} chars)", flush=True)
                     self._claude_pending_prompt = text
                     self.send_long(f"🧠 <b>Claude's Plan:</b>\n\n{_escape_html(response)}")
-                    self.send("👆 /approve to implement, /reject to cancel")
+                    self.send("👆 /approve to implement, /reject to cancel" + self._claude_stats_footer())
                 elif response and response.startswith("Error:"):
                     print(f"[claude] Error: {response[:200]}", flush=True)
                     self.send(f"❌ {_escape_html(response)}")
@@ -527,6 +541,9 @@ class TeleClaudeBot:
                 if response and not response.startswith("Error:"):
                     print(f"[claude] Implementation complete ({len(response)} chars)", flush=True)
                     self.send_long(f"✅ <b>Done!</b>\n\n{_escape_html(response)}")
+                    footer = self._claude_stats_footer()
+                    if footer:
+                        self.send(footer)
                 elif response and response.startswith("Error:"):
                     print(f"[claude] Implementation error: {response[:200]}", flush=True)
                     self.send(f"❌ {_escape_html(response)}")
@@ -557,7 +574,7 @@ class TeleClaudeBot:
         """Build the Claude Code main menu. Returns (text, keyboard)."""
         status_icon = "🔴" if self._claude_busy else "🟢"
         status_text = "Busy" if self._claude_busy else "Available"
-        polling_text = " | 📡 Polling for availability" if self._context_polling else ""
+        polling_text = " | 📡 Polling" if self._context_polling else ""
 
         if self.claude.session_name:
             sid_short = f"…{self.claude.pinned_session_id[:8]}" if self.claude.pinned_session_id else ""
@@ -571,11 +588,27 @@ class TeleClaudeBot:
             snippet = self._claude_pending_prompt[:50]
             pending_text = f"\n📋 Pending plan: <i>{snippet}...</i>"
 
+        # Model + compact stats line
+        model_line = f"\n🤖 Model: <b>{self.claude.model}</b>"
+        stats_line = ""
+        s = self.claude.stats
+        if s.total_turns > 0:
+            pct = self.claude.context_pct
+            parts = [f"💰 ${s.total_cost_usd:.3f}", f"🔄 {s.total_turns}"]
+            if pct is not None:
+                filled = int(pct / 10)
+                bar = "█" * filled + "░" * (10 - filled)
+                warn = " ⚠️" if pct > 80 else ""
+                parts.append(f"📊 [{bar}] {pct:.0f}%{warn}")
+            stats_line = "\n" + " | ".join(parts)
+
         msg = (
             f"<b>🧠 Claude Code</b> (CLI subprocess)\n"
             f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
             f"{status_icon} Status: <b>{status_text}</b>{polling_text}\n"
             f"{session_line}"
+            f"{model_line}"
+            f"{stats_line}"
             f"{pending_text}"
         )
 
@@ -587,6 +620,13 @@ class TeleClaudeBot:
                 {"text": "✅ Approve Plan", "callback_data": "claude:approve"},
                 {"text": "🚫 Reject Plan", "callback_data": "claude:reject"},
             ])
+
+        # Model switcher row
+        model_buttons = []
+        for m in VALID_MODELS:
+            icon = "◉" if self.claude.model == m else "○"
+            model_buttons.append({"text": f"{icon} {m.title()}", "callback_data": f"claude:model_{m}"})
+        buttons.append(model_buttons)
 
         buttons.append([{"text": "📌 Session Info", "callback_data": "claude:session"}])
         buttons.append([{"text": "🔄 Flush & New Session", "callback_data": "claude:flush"}])
@@ -611,6 +651,23 @@ class TeleClaudeBot:
             msg += "📌 Pinned: <i>none</i>\n"
         if active and active != pinned:
             msg += f"🔄 Active: <code>{active}</code>\n"
+        msg += f"🤖 Model: <b>{self.claude.model}</b>\n"
+
+        # Session stats
+        s = self.claude.stats
+        if s.total_turns > 0:
+            msg += f"\n<b>📊 Session Stats</b>\n"
+            msg += f"🔄 Turns: {s.total_turns}\n"
+            msg += f"💰 Cost: ${s.total_cost_usd:.4f}\n"
+            msg += f"⏱ Duration: {s.total_duration_ms / 1000:.1f}s\n"
+            msg += f"📥 In: {s.total_input_tokens:,}  📤 Out: {s.total_output_tokens:,}\n"
+            msg += f"💾 Cache: {s.total_cache_read_tokens:,} read / {s.total_cache_creation_tokens:,} created\n"
+            pct = self.claude.context_pct
+            if pct is not None:
+                filled = int(pct / 10)
+                bar = "█" * filled + "░" * (10 - filled)
+                warn = " ⚠️ Consider flushing" if pct > 80 else ""
+                msg += f"📊 Context: [{bar}] {pct:.0f}%{warn}\n"
 
         msg += "\n<i>To pin a new session, send:</i>\n<code>/session pin &lt;session_id&gt;</code>"
 
@@ -683,6 +740,15 @@ class TeleClaudeBot:
             text, keyboard = self._build_claude_menu()
             self.edit_message(message_id, text, keyboard)
 
+        elif data.startswith("claude:model_"):
+            model = data.split("_", 1)[1]
+            if self.claude.set_model(model):
+                text, keyboard = self._build_claude_menu()
+                self.edit_message(message_id, f"🤖 Model → <b>{model}</b>\n\n" + text, keyboard)
+            else:
+                text, keyboard = self._build_claude_menu()
+                self.edit_message(message_id, f"❌ Unknown model: {model}\n\n" + text, keyboard)
+
         elif data == "claude:flush":
             self.edit_message(message_id, "🔄 Flushing session... generating summary from current session.")
             self._flush_and_new_session(message_id)
@@ -706,6 +772,12 @@ class TeleClaudeBot:
                     self.edit_message(message_id, f"❌ Handoff write failed — .handoff.md not created.\n{(result or '')[:300]}", back_kb)
                     return
 
+                # Capture stats before clearing
+                s = self.claude.stats
+                recap = ""
+                if s.total_turns > 0:
+                    recap = f"\n📊 Session recap: {s.total_turns} turns · ${s.total_cost_usd:.3f} · {s.total_duration_ms / 1000:.1f}s"
+
                 self.edit_message(message_id, "🔄 Step 2/2: Clearing session pin...")
                 self.claude.clear()  # ClaudeSession auto-bootstraps from .handoff.md on next message
 
@@ -714,7 +786,8 @@ class TeleClaudeBot:
                     message_id,
                     f"✅ <b>Session flushed!</b>\n\n"
                     f"📝 Context saved to <code>.handoff.md</code>\n"
-                    f"🔄 Next message will start a new session with handoff context",
+                    f"🔄 Next message will start a new session with handoff context"
+                    f"{recap}",
                     back_kb,
                 )
 

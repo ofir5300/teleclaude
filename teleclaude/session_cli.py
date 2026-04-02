@@ -5,6 +5,7 @@ Session IDs are persisted to disk and resumed with --resume for multi-turn conte
 Supports named sessions, pinned SSOT semantics, stream-json parsing, and handoff bootstrap.
 """
 
+import dataclasses
 import json
 import logging
 import os
@@ -13,6 +14,24 @@ from pathlib import Path
 from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
+
+VALID_MODELS = ("opus", "sonnet", "haiku")
+
+
+@dataclasses.dataclass
+class SessionStats:
+    """Cumulative usage stats for a Claude session."""
+
+    total_turns: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cache_read_tokens: int = 0
+    total_cache_creation_tokens: int = 0
+    total_cost_usd: float = 0.0
+    total_duration_ms: int = 0
+    context_window: int = 0        # from latest turn's modelUsage
+    last_input_tokens: int = 0     # latest turn's input + cache_read (context size)
+
 
 # Default tools for each mode - callers can override
 PLAN_TOOLS = ["Read", "Glob", "Grep", "Bash", "WebFetch", "WebSearch", "Agent"]
@@ -78,6 +97,7 @@ class ClaudeSession:
         self._session_id: str | None = None
         self._pinned_session_id: str | None = None
         self._session_name: str | None = None
+        self._stats = SessionStats()
 
         self._load_session()
         self._load_session_name()
@@ -162,15 +182,33 @@ class ClaudeSession:
 
     # -- Output parsing ----------------------------------------------------
 
-    def _parse_json(self, result) -> tuple[str, str]:
+    @staticmethod
+    def _extract_meta(data: dict) -> dict:
+        """Extract usage metadata from a CLI result dict."""
+        usage = data.get("usage", {})
+        model_usage = data.get("modelUsage", {})
+        context_window = 0
+        for info in model_usage.values():
+            context_window = info.get("contextWindow", 0)
+        return {
+            "duration_ms": data.get("duration_ms", 0),
+            "total_cost_usd": data.get("total_cost_usd", 0.0),
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+            "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
+            "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
+            "context_window": context_window,
+        }
+
+    def _parse_json(self, result) -> tuple[str, str, dict]:
         """Parse --output-format json output."""
         try:
             data = json.loads(result.stdout or "{}")
-            return data.get("result", ""), data.get("session_id", "")
+            return data.get("result", ""), data.get("session_id", ""), self._extract_meta(data)
         except json.JSONDecodeError:
-            return (result.stdout or "").strip(), ""
+            return (result.stdout or "").strip(), "", {}
 
-    def _parse_stream_json(self, result) -> tuple[str, str]:
+    def _parse_stream_json(self, result) -> tuple[str, str, dict]:
         """Parse --output-format stream-json output.
 
         stream-json emits one JSON object per line. We collect all assistant
@@ -181,6 +219,7 @@ class ClaudeSession:
         texts = []
         session_id = ""
         final_result = ""
+        meta = {}
         for line in (result.stdout or "").splitlines():
             line = line.strip()
             if not line:
@@ -197,12 +236,13 @@ class ClaudeSession:
             elif msg_type == "result":
                 session_id = d.get("session_id", "")
                 final_result = (d.get("result", "") or "").strip()
+                meta = self._extract_meta(d)
         # Prefer the result summary; fall back to all assistant text blocks joined
         # (not just texts[-1] — Claude may split a single response across many blocks)
         response = final_result or "\n\n".join(texts)
-        return response, session_id
+        return response, session_id, meta
 
-    def _parse(self, result) -> tuple[str, str]:
+    def _parse(self, result) -> tuple[str, str, dict]:
         if self.output_format == "stream-json":
             return self._parse_stream_json(result)
         return self._parse_json(result)
@@ -259,9 +299,10 @@ class ClaudeSession:
 
         # ── Try with pinned / current session ──────────────────────────
         resumed = False
+        meta = {}
         if self._session_id:
             result = _run(base_cmd + ["--resume", self._session_id, "-p", prompt])
-            response_text, returned_session = self._parse(result)
+            response_text, returned_session, meta = self._parse(result)
 
             if result.returncode != 0 and not response_text:
                 # Session not found or expired — fall back to fresh
@@ -279,7 +320,7 @@ class ClaudeSession:
                     cmd_suffix = ["--name", new_name] + cmd_suffix
                     self._save_session_name(new_name)
                 result = _run(base_cmd + cmd_suffix)
-                response_text, returned_session = self._parse(result)
+                response_text, returned_session, meta = self._parse(result)
             else:
                 resumed = True
         else:
@@ -301,7 +342,7 @@ class ClaudeSession:
             if new_name:
                 cmd_suffix = ["--name", new_name] + cmd_suffix
             result = _run(base_cmd + cmd_suffix)
-            response_text, returned_session = self._parse(result)
+            response_text, returned_session, meta = self._parse(result)
 
         # ── Update session state ──────────────────────────────────────
         if returned_session:
@@ -318,6 +359,10 @@ class ClaudeSession:
                 elif not resumed and not self._pinned_session_id:
                     self._save_session(returned_session)
 
+        # ── Accumulate usage stats ────────────────────────────────────
+        if meta:
+            self._update_stats(meta)
+
         if result.returncode != 0 and not response_text:
             error_msg = (result.stderr or "unknown").strip()[:500]
             print(f"[claude-cli] Failed (exit={result.returncode}): {error_msg[:200]}", flush=True)
@@ -326,6 +371,41 @@ class ClaudeSession:
             print(f"[claude-cli] Finished (exit={result.returncode}, {len(response_text)} chars response)", flush=True)
 
         return response_text
+
+    # -- Stats -------------------------------------------------------------
+
+    def _update_stats(self, meta: dict):
+        """Accumulate usage stats from a single CLI invocation."""
+        s = self._stats
+        s.total_turns += 1
+        s.total_duration_ms += meta.get("duration_ms", 0)
+        s.total_cost_usd += meta.get("total_cost_usd", 0.0)
+        s.total_input_tokens += meta.get("input_tokens", 0)
+        s.total_output_tokens += meta.get("output_tokens", 0)
+        s.total_cache_read_tokens += meta.get("cache_read_input_tokens", 0)
+        s.total_cache_creation_tokens += meta.get("cache_creation_input_tokens", 0)
+        if meta.get("context_window"):
+            s.context_window = meta["context_window"]
+        s.last_input_tokens = meta.get("input_tokens", 0) + meta.get("cache_read_input_tokens", 0)
+
+    @property
+    def stats(self) -> SessionStats:
+        return self._stats
+
+    @property
+    def context_pct(self) -> float | None:
+        """Percentage of context window consumed (0-100), or None if unknown."""
+        s = self._stats
+        if s.context_window <= 0 or s.last_input_tokens <= 0:
+            return None
+        return min(100.0, (s.last_input_tokens / s.context_window) * 100)
+
+    def set_model(self, model: str) -> bool:
+        """Switch model for subsequent CLI invocations."""
+        if model in VALID_MODELS:
+            self.model = model
+            return True
+        return False
 
     # -- Session management -----------------------------------------------
 
@@ -348,6 +428,7 @@ class ClaudeSession:
         self._session_id = None
         self._pinned_session_id = None
         self._clear_session_name()
+        self._stats = SessionStats()
         try:
             Path(self.session_file).unlink()
         except FileNotFoundError:
@@ -358,6 +439,7 @@ class ClaudeSession:
         self._session_id = None
         self._pinned_session_id = None
         self._clear_session_name()
+        self._stats = SessionStats()
         try:
             Path(self.session_file).unlink()
         except FileNotFoundError:
