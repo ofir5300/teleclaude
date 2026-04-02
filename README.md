@@ -6,8 +6,9 @@
 
 # TeleClaude
 
+**A Python framework for building Telegram bots that use [Claude Code](https://github.com/anthropics/claude-code) to read, plan, and edit their own codebase - with human-in-the-loop approval, voice transcription via OpenAI Whisper, and self-restarting deployment.**
 
-**Build self-improving applications with Telegram + Claude Code.**
+<sub>`anthropic` `claude-code` `claude-code-channels` `telegram-bot` `ai-agent` `self-improving-software` `whisper` `voice-to-code` `agentic-coding` `python`</sub>
 
 <p align="center">
   <a href="https://pypi.org/project/teleclaude/"><img src="https://img.shields.io/pypi/v/teleclaude?color=blue" alt="PyPI"></a>
@@ -17,15 +18,13 @@
 
 ---
 
-## The idea: conversational self-improvement
+## The idea: let Claude Code edit itself through Telegram
 
-TeleClaude enables **agentic self-development** - your deployed application becomes its own development environment. You talk to it through Telegram, it understands its own codebase via [Claude Code](https://github.com/anthropics/claude-code), proposes changes, and - once you approve - rewrites its own source code and restarts itself with the improvements live.
+Your bot is a thin Telegram relay. **[Claude Code](https://github.com/anthropics/claude-code) is the agentic part** - it reads the codebase, proposes changes, and writes files when you approve. The bot just forwards your messages to Claude Code and sends back the response.
 
-This is a **closed-loop development cycle**: `chat -> analyze -> plan -> approve -> edit -> restart`. No IDE, no SSH, no deploy pipeline. Just a conversation with your running application from your phone.
+The result is a **closed-loop development cycle**: `chat -> analyze -> plan -> approve -> edit -> restart`. No IDE, no SSH, no deploy pipeline. Just a conversation with your running application from your phone - or even a voice message transcribed via [Whisper](https://github.com/openai/whisper).
 
-The technical pattern is sometimes called **reflexive software** or **agentic bootstrapping** - a system that can inspect and modify itself through an AI agent. TeleClaude packages this into a simple Python framework.
-
-**Why?** [Claude Code](https://docs.anthropic.com/en/docs/claude-code) is a powerful agentic coding tool (82K+ stars), but it lives in your terminal. TeleClaude lets you talk to it from anywhere - your phone, a group chat, on the go - while keeping the human-in-the-loop approval flow that makes it safe for real codebases.
+**What about [Claude Code Channels](https://docs.anthropic.com/en/docs/claude-code/channels)?** Anthropic's official Telegram/Discord/iMessage channels are a promising direction, but they're still in research preview - when we last tested them, the experience wasn't stable enough for production use. TeleClaude was built to fill that gap: your bot runs Claude Code as a subprocess on the server where it's deployed, with a plan/approve workflow and self-restart baked in. No local machine needed, no `--channels` flag, no Bun dependency - just `pip install` and go. If Channels matures into a solid production path, we'd love to add it as an alternative backend - [contributions welcome](https://github.com/ofir5300/teleclaude/issues).
 
 <img src="assets/claude-bot.png" alt="Claude Bot" width="60">
 
@@ -41,9 +40,7 @@ The technical pattern is sometimes called **reflexive software** or **agentic bo
 +----------------+        +-----------------+        +--------------------+
 ```
 
-<table>
-<tr>
-<td valign="top" style="white-space: nowrap;">
+<a href="assets/example-from-polybot.png"><img align="right" src="assets/example-from-polybot.png" alt="Claude control example from PolyBot" height="190"></a>
 
 1. You send a message in Telegram
 2. TeleClaude routes it to Claude Code in **read-only plan mode**
@@ -53,14 +50,7 @@ The technical pattern is sometimes called **reflexive software** or **agentic bo
 6. `/restart` reloads the bot to pick up code changes
 7. The application is now running its improved version of itself
 
-</td>
-<td align="center" valign="middle">
-
-<a href="assets/example-from-polybot.png"><img src="assets/example-from-polybot.png" alt="Claude control example from PolyBot" height="190"></a>
-
-</td>
-</tr>
-</table>
+<br clear="right">
 
 ## Quickstart
 
@@ -175,23 +165,6 @@ session = ClaudeSession(project_dir=".", bootstrap_file=".handoff.md")
 
 When Claude returns a rate-limit error, the bot automatically starts background polling (every 5 min, up to 12 h) and notifies you when Claude is back online. You can also manually check via `/context` or the `/claude` menu.
 
-## Session modes
-
-### CLI mode (`ClaudeSession`) - recommended
-
-Spawns `claude --print` as a subprocess per message with JSON output parsing. Features:
-
-- **Session persistence**: IDs saved to disk, resumed with `--resume` for multi-turn context
-- **Two permission modes**: plan (read-only) and edit (file modifications)
-- **Automatic fallback**: expired sessions gracefully restart fresh
-- **Model switching**: Opus, Sonnet, Haiku - switchable via `/claude` menu or `set_model()`
-- **Usage stats**: tokens, cost, context window % tracked via `SessionStats`
-- **Configurable**: custom tools, max turns, output format, named sessions
-
-### Channel mode (`ClaudeChannelSession`) - future
-
-Stub for the upcoming Anthropic SDK channel API. Not yet functional - `run()` raises `NotImplementedError`. Will share the same interface as CLI mode when available.
-
 ## Configuration reference
 
 ### `ClaudeSession` options
@@ -212,69 +185,15 @@ session = ClaudeSession(
 )
 ```
 
-### `SessionStats`
-
-Cumulative usage stats, accessible via `session.stats`:
-
-| Field | Type | Description |
-| ----- | ---- | ----------- |
-| `total_turns` | `int` | Number of CLI invocations |
-| `total_cost_usd` | `float` | Accumulated API cost |
-| `total_duration_ms` | `int` | Total wall-clock time |
-| `total_input_tokens` | `int` | Input tokens consumed |
-| `total_output_tokens` | `int` | Output tokens generated |
-| `total_cache_read_tokens` | `int` | Tokens served from cache |
-| `total_cache_creation_tokens` | `int` | Tokens written to cache |
-| `context_window` | `int` | Model's context window size |
-
-Context usage percentage: `session.context_pct` (0-100 or `None` if unknown).
-
-## Architecture
-
-```
-teleclaude/
-  session_cli.py      # Claude Code subprocess wrapper with session persistence
-  session_channel.py  # Channel API stub (same interface, future)
-  base_bot.py         # Telegram base class: /approve, /reject, /restart + free-text routing
-  self_update.py      # PID file management + os.execv restart
-```
-
-| Module            | What it does                                                               |
-| ----------------- | -------------------------------------------------------------------------- |
-| `ClaudeSession`   | Wraps `claude --print` with session pinning, plan/edit modes, JSON parsing |
-| `TeleClaudeBot`   | Sync Telegram bot (`requests`-based) with plan/approve/execute workflow. Extensible via hooks |
-| `kill_previous()` | PID file management - kills stale bot processes on startup                 |
-| `restart()`       | `os.execv` process replacement - reload code without downtime              |
-
-## Local development
+## Development
 
 ```bash
 git clone https://github.com/ofir5300/teleclaude.git
 cd teleclaude
 pip install -e .
-cd example
-cp .env.example .env  # fill in your tokens
+cd example && cp .env.example .env  # fill in your tokens
 python main.py
 ```
-
-## Related resources
-
-**Claude Code:**
-
-- [Claude Code - Official GitHub](https://github.com/anthropics/claude-code) (82K+ stars)
-- [Claude Code Documentation](https://docs.anthropic.com/en/docs/claude-code)
-- [Claude Code Overview](https://code.claude.com/docs/en/overview)
-
-**Guides and tutorials:**
-
-- [Claude Code Tutorial for Beginners 2026](https://dev.to/ayyazzafar/claude-code-tutorial-for-beginners-2026-from-installation-to-building-your-first-project-1lma) - dev.to
-- [Claude Code: A Guide With Practical Examples](https://www.datacamp.com/tutorial/claude-code) - DataCamp
-- [Claude Code CLI Cheatsheet](https://shipyard.build/blog/claude-code-cheat-sheet/) - Shipyard
-
-**Community:**
-
-- [What makes Claude Code so good](https://news.ycombinator.com/item?id=44998295) - Hacker News discussion
-- [awesome-claude-code](https://github.com/hesreallyhim/awesome-claude-code) - Curated plugins, hooks, and commands
 
 ## Contributing
 

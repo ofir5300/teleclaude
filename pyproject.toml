@@ -10,7 +10,7 @@ license = {text = "MIT"}
 authors = [{name = "Ofir Cohen", email = "ofir5300@users.noreply.github.com"}]
 readme = "README.md"
 requires-python = ">=3.10"
-keywords = ["telegram", "claude", "bot", "ai", "claude-code"]
+keywords = ["telegram", "claude", "claude-code", "claude-code-channels", "anthropic", "bot", "ai", "agentic", "whisper", "voice", "self-improving", "telegram-bot"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: MIT License",
