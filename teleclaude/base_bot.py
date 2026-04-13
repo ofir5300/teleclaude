@@ -411,12 +411,30 @@ class TeleClaudeBot:
         try:
             import requests as _requests
 
-            # Clear any manually-set BotFather commands first
-            _requests.post(f"{self.base_url}/deleteMyCommands", timeout=10)
+            # Clear commands at all scopes — BotFather or prior code may have set
+            # empty overrides at narrower scopes (e.g. all_private_chats) which
+            # hide the default-scope commands from the Telegram menu.
+            for scope in [
+                None,  # default scope
+                {"type": "all_private_chats"},
+                {"type": "all_group_chats"},
+                {"type": "all_chat_administrators"},
+            ]:
+                payload = {"scope": scope} if scope else {}
+                dr = _requests.post(f"{self.base_url}/deleteMyCommands", json=payload, timeout=10)
+                label = scope["type"] if scope else "default"
+                print(f"[cmd-reg] deleteMyCommands({label}): {dr.status_code}", flush=True)
 
             url = f"{self.base_url}/setMyCommands"
             resp = _requests.post(url, json={"commands": bot_commands}, timeout=10)
-            if resp.status_code == 200:
+            print(f"[cmd-reg] setMyCommands: {resp.status_code} {resp.json()}", flush=True)
+
+            # Verify what Telegram actually has
+            get_resp = _requests.post(f"{self.base_url}/getMyCommands", timeout=10)
+            registered = get_resp.json()
+            print(f"[cmd-reg] getMyCommands: {len(registered.get('result', []))} commands: {registered}", flush=True)
+
+            if resp.status_code == 200 and resp.json().get("ok"):
                 print(f"[i] Telegram bot commands registered ({len(bot_commands)} commands)", flush=True)
             else:
                 print(f"[!] Failed to register commands: {resp.status_code} {resp.text[:200]}", flush=True)

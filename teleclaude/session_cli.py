@@ -92,6 +92,7 @@ class ClaudeSession:
         logs_dir = str(Path(self.session_file).parent)
         self._session_name_file = os.path.join(logs_dir, "claude_session_name.txt")
         self._counter_file = os.path.join(logs_dir, "telegram_session_counter.txt")
+        self._model_file = os.path.join(logs_dir, "claude_model.txt")
 
         # Session state
         self._session_id: str | None = None
@@ -101,6 +102,7 @@ class ClaudeSession:
 
         self._load_session()
         self._load_session_name()
+        self._load_model(model)
 
     # -- Session persistence -----------------------------------------------
 
@@ -362,6 +364,8 @@ class ClaudeSession:
         # ── Accumulate usage stats ────────────────────────────────────
         if meta:
             self._update_stats(meta)
+        else:
+            print("[claude-cli] Warning: no usage metadata in CLI response", flush=True)
 
         if result.returncode != 0 and not response_text:
             error_msg = (result.stderr or "unknown").strip()[:500]
@@ -387,6 +391,10 @@ class ClaudeSession:
         if meta.get("context_window"):
             s.context_window = meta["context_window"]
         s.last_input_tokens = meta.get("input_tokens", 0) + meta.get("cache_read_input_tokens", 0)
+        pct = self.context_pct
+        pct_str = f" ({pct:.0f}%)" if pct is not None else ""
+        print(f"[claude-cli] Stats: turn={s.total_turns} cost=${s.total_cost_usd:.4f} "
+              f"ctx={s.last_input_tokens}/{s.context_window}{pct_str}", flush=True)
 
     @property
     def stats(self) -> SessionStats:
@@ -400,10 +408,31 @@ class ClaudeSession:
             return None
         return min(100.0, (s.last_input_tokens / s.context_window) * 100)
 
+    def _load_model(self, default: str):
+        """Load persisted model choice, falling back to default."""
+        try:
+            p = Path(self._model_file)
+            if p.exists():
+                saved = p.read_text().strip()
+                if saved in VALID_MODELS:
+                    self.model = saved
+                    return
+        except Exception:
+            pass
+        self.model = default
+
+    def _save_model(self, model: str):
+        try:
+            Path(self._model_file).parent.mkdir(parents=True, exist_ok=True)
+            Path(self._model_file).write_text(model)
+        except Exception:
+            pass
+
     def set_model(self, model: str) -> bool:
-        """Switch model for subsequent CLI invocations."""
+        """Switch model for subsequent CLI invocations (persisted to disk)."""
         if model in VALID_MODELS:
             self.model = model
+            self._save_model(model)
             return True
         return False
 

@@ -23,6 +23,7 @@ logs/claude_session.txt
 
 # IDE
 .vscode/
+.superset/
 .idea/
 *.swp
 *.swo
