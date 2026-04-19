@@ -396,13 +396,10 @@ class TeleClaudeBot:
 
     def _register_commands(self):
         """Register bot commands with Telegram (updates BotFather menu)."""
+        # Only register /claude + /help at root; other Claude commands
+        # are accessible via the /claude inline keyboard menu.
         bot_commands = [
             {"command": "claude", "description": "Claude Code menu"},
-            {"command": "session", "description": "Claude session management"},
-            {"command": "context", "description": "Context polling"},
-            {"command": "approve", "description": "Approve pending action"},
-            {"command": "reject", "description": "Reject pending action"},
-            {"command": "restart", "description": "Restart the bot process"},
             {"command": "help", "description": "Show help message"},
         ]
         for cmd, (_handler, desc) in self.domain_commands().items():
@@ -468,10 +465,24 @@ class TeleClaudeBot:
         parts = [f"💰 ${s.total_cost_usd:.3f}", f"⏱ {s.total_duration_ms / 1000:.1f}s"]
         pct = self.claude.context_pct
         if pct is not None:
-            parts.append(f"📊 {pct:.0f}%")
+            arrow, _ = self.claude.context_trend
+            peak_str = f" (peak {s.peak_context_pct:.0f}%)" if s.peak_context_pct > pct + 1 else ""
+            est = self.claude.est_turns_remaining
+            est_str = f" ~{est} left" if est is not None else ""
+            time_left = self.claude.est_time_remaining
+            if time_left is not None and time_left > 0:
+                if time_left >= 60:
+                    est_str += f" ≈{time_left // 60}m"
+                else:
+                    est_str += f" ≈{time_left}s"
+            parts.append(f"📊 {pct:.0f}% {arrow}{peak_str}{est_str}")
         footer = "\n\n<i>" + " · ".join(parts) + "</i>"
         if pct is not None and pct > 85:
             footer += "\n⚠️ <i>Context {:.0f}% full — consider flushing session</i>".format(pct)
+        # Compaction alert (shown once)
+        if s.last_compaction_from > 0:
+            footer += f"\n🔄 <i>Context was auto-compacted ({s.last_compaction_from:.0f}% → {pct:.0f}%)</i>"
+            s.last_compaction_from = 0.0
         return footer
 
     def _handle_claude_message(self, text: str):
@@ -616,8 +627,10 @@ class TeleClaudeBot:
             if pct is not None:
                 filled = int(pct / 10)
                 bar = "█" * filled + "░" * (10 - filled)
+                arrow, _ = self.claude.context_trend
                 warn = " ⚠️" if pct > 80 else ""
-                parts.append(f"📊 [{bar}] {pct:.0f}%{warn}")
+                peak_str = f" pk:{s.peak_context_pct:.0f}%" if s.peak_context_pct > pct + 1 else ""
+                parts.append(f"📊 [{bar}] {pct:.0f}% {arrow}{peak_str}{warn}")
             stats_line = "\n" + " | ".join(parts)
 
         msg = (
@@ -648,6 +661,7 @@ class TeleClaudeBot:
 
         buttons.append([{"text": "📌 Session Info", "callback_data": "claude:session"}])
         buttons.append([{"text": "🔄 Flush & New Session", "callback_data": "claude:flush"}])
+        buttons.append([{"text": "⚡ Restart Bot", "callback_data": "claude:restart"}])
 
         if self._context_polling:
             buttons.append([{"text": "⏹ Stop Polling", "callback_data": "claude:poll_stop"}])
@@ -682,10 +696,33 @@ class TeleClaudeBot:
             msg += f"💾 Cache: {s.total_cache_read_tokens:,} read / {s.total_cache_creation_tokens:,} created\n"
             pct = self.claude.context_pct
             if pct is not None:
+                msg += f"\n<b>📊 Context Window</b>\n"
                 filled = int(pct / 10)
                 bar = "█" * filled + "░" * (10 - filled)
-                warn = " ⚠️ Consider flushing" if pct > 80 else ""
-                msg += f"📊 Context: [{bar}] {pct:.0f}%{warn}\n"
+                warn = " ⚠️" if pct > 80 else ""
+                msg += f"├ Current: [{bar}] {pct:.0f}%{warn}\n"
+                if s.peak_context_pct > pct + 1:
+                    pfilled = int(s.peak_context_pct / 10)
+                    pbar = "█" * pfilled + "░" * (10 - pfilled)
+                    msg += f"├ Peak:    [{pbar}] {s.peak_context_pct:.0f}%\n"
+                arrow, delta = self.claude.context_trend
+                if len(s.context_history) >= 2:
+                    msg += f"├ Trend:   {arrow} ({delta:+.0f}% last turn)\n"
+                avg_g = self.claude.avg_growth_per_turn
+                est_label = "~" if len(s.context_history) < 2 else ""
+                msg += f"├ Avg growth: {est_label}{avg_g:.1f}%/turn\n"
+                est = self.claude.est_turns_remaining
+                if est is not None:
+                    time_left = self.claude.est_time_remaining
+                    time_str = ""
+                    if time_left is not None and time_left > 0:
+                        if time_left >= 60:
+                            time_str = f" ≈ {time_left // 60}m"
+                        else:
+                            time_str = f" ≈ {time_left}s"
+                    msg += f"└ Remaining: ~{est} turns{time_str}\n"
+                elif pct > 80:
+                    msg += f"└ ⚠️ Consider flushing session\n"
 
         msg += "\n<i>To pin a new session, send:</i>\n<code>/session pin &lt;session_id&gt;</code>"
 
@@ -766,6 +803,10 @@ class TeleClaudeBot:
             else:
                 text, keyboard = self._build_claude_menu()
                 self.edit_message(message_id, f"❌ Unknown model: {model}\n\n" + text, keyboard)
+
+        elif data == "claude:restart":
+            self.edit_message(message_id, "⚡ Restarting bot...")
+            self._cmd_restart()
 
         elif data == "claude:flush":
             self.edit_message(message_id, "🔄 Flushing session... generating summary from current session.")

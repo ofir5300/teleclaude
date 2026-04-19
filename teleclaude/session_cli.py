@@ -31,6 +31,9 @@ class SessionStats:
     total_duration_ms: int = 0
     context_window: int = 0        # from latest turn's modelUsage
     last_input_tokens: int = 0     # latest turn's input + cache_read (context size)
+    context_history: list = dataclasses.field(default_factory=list)  # [(turn, pct)]
+    peak_context_pct: float = 0.0
+    last_compaction_from: float = 0.0  # pct before compaction (0 = none detected)
 
 
 # Default tools for each mode - callers can override
@@ -390,11 +393,25 @@ class ClaudeSession:
         s.total_cache_creation_tokens += meta.get("cache_creation_input_tokens", 0)
         if meta.get("context_window"):
             s.context_window = meta["context_window"]
-        s.last_input_tokens = meta.get("input_tokens", 0) + meta.get("cache_read_input_tokens", 0)
+        # Total prompt = uncached + cache_read + cache_creation
+        in_tok = meta.get("input_tokens", 0)
+        cache_read = meta.get("cache_read_input_tokens", 0)
+        cache_create = meta.get("cache_creation_input_tokens", 0)
+        s.last_input_tokens = in_tok + cache_read + cache_create
         pct = self.context_pct
+        # Track context history, peak, and compaction
+        if pct is not None:
+            prev_pct = s.context_history[-1][1] if s.context_history else None
+            s.context_history.append((s.total_turns, pct))
+            if pct > s.peak_context_pct:
+                s.peak_context_pct = pct
+            # Detect compaction: only when prev was near-full and dropped sharply
+            if prev_pct is not None and prev_pct > 85 and prev_pct - pct > 20:
+                s.last_compaction_from = prev_pct
         pct_str = f" ({pct:.0f}%)" if pct is not None else ""
         print(f"[claude-cli] Stats: turn={s.total_turns} cost=${s.total_cost_usd:.4f} "
-              f"ctx={s.last_input_tokens}/{s.context_window}{pct_str}", flush=True)
+              f"ctx={s.last_input_tokens}/{s.context_window}{pct_str} "
+              f"[in={in_tok} cread={cache_read} ccreate={cache_create}]", flush=True)
 
     @property
     def stats(self) -> SessionStats:
@@ -407,6 +424,55 @@ class ClaudeSession:
         if s.context_window <= 0 or s.last_input_tokens <= 0:
             return None
         return min(100.0, (s.last_input_tokens / s.context_window) * 100)
+
+    @property
+    def context_trend(self) -> tuple[str, float]:
+        """Return (arrow, delta) showing context direction since last turn."""
+        h = self._stats.context_history
+        if len(h) < 2:
+            return ("→", 0.0)
+        delta = h[-1][1] - h[-2][1]
+        if delta > 2:
+            return ("↑", delta)
+        elif delta < -2:
+            return ("↓", delta)
+        return ("→", delta)
+
+    _DEFAULT_GROWTH_PER_TURN = 5.0  # conservative fallback when <2 data points
+
+    @property
+    def avg_growth_per_turn(self) -> float:
+        """Average context growth per turn (skipping compaction drops)."""
+        h = self._stats.context_history
+        if len(h) < 2:
+            return self._DEFAULT_GROWTH_PER_TURN
+        growths = [h[i][1] - h[i - 1][1] for i in range(1, len(h)) if h[i][1] > h[i - 1][1]]
+        if not growths:
+            return self._DEFAULT_GROWTH_PER_TURN
+        return sum(growths) / len(growths)
+
+    @property
+    def est_turns_remaining(self) -> int | None:
+        """Estimate turns until context is full, based on avg growth per turn."""
+        h = self._stats.context_history
+        if not h:
+            return None
+        avg_growth = self.avg_growth_per_turn
+        if avg_growth <= 0:
+            return None
+        current = h[-1][1]
+        remaining = (100 - current) / avg_growth
+        return max(0, int(remaining))
+
+    @property
+    def est_time_remaining(self) -> int | None:
+        """Estimate seconds until context is full, based on avg turn duration."""
+        s = self._stats
+        est_turns = self.est_turns_remaining
+        if est_turns is None or s.total_turns == 0:
+            return None
+        avg_turn_secs = (s.total_duration_ms / s.total_turns) / 1000
+        return max(0, int(est_turns * avg_turn_secs))
 
     def _load_model(self, default: str):
         """Load persisted model choice, falling back to default."""
