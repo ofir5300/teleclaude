@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "teleclaude"
-version = "0.2.0"
+version = "0.2.1"
 description = "Telegram bot framework with Claude Code session integration"
 license = {text = "MIT"}
 authors = [{name = "Ofir Cohen", email = "ofir5300@users.noreply.github.com"}]
