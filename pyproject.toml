@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=68.0", "wheel", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "teleclaude"
-version = "0.2.1"
+dynamic = ["version"]
 description = "Telegram bot framework with Claude Code session integration"
 license = {text = "MIT"}
 authors = [{name = "Ofir Cohen", email = "ofir5300@users.noreply.github.com"}]
@@ -34,3 +34,7 @@ dev = ["ruff", "pytest"]
 
 [tool.setuptools.packages.find]
 include = ["teleclaude*"]
+
+[tool.setuptools_scm]
+# Version derived from git tags (vX.Y.Z). Tag the commit, push, CI publishes.
+# No version field anywhere in source — single source of truth is the git tag.
