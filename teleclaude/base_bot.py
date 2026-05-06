@@ -78,6 +78,22 @@ class TeleClaudeBot:
         self._context_polling = False
         self._context_poll_thread = None
 
+        # Continuous availability watcher (toggleable from /claude menu).
+        # Probes every 60m while free, 15m while blocked; alerts on blocked->free transitions.
+        # Toggle state persists across restarts via ~/.teleclaude/watcher_enabled.
+        self._watcher_state_file = Path.home() / ".teleclaude" / "watcher_enabled"
+        self._watcher_enabled = False
+        self._watcher_thread = None
+        self._watcher_prev_blocked: bool | None = None
+        if self._watcher_state_file.exists():
+            try:
+                if self._watcher_state_file.read_text().strip() == "1":
+                    # Defer actual start until after __init__ finishes (thread can call self.send)
+                    threading.Timer(2.0, self._start_watcher).start()
+                    print("[watcher] auto-resuming from persisted state", flush=True)
+            except OSError:
+                pass
+
         # Whisper model (lazy-loaded on first voice message)
         self._whisper_model = None
 
@@ -666,6 +682,12 @@ class TeleClaudeBot:
         if self._context_polling:
             buttons.append([{"text": "⏹ Stop Polling", "callback_data": "claude:poll_stop"}])
 
+        watcher_label = (
+            "🔔 Usage-limit watcher: ON" if self._watcher_enabled
+            else "🔕 Usage-limit watcher: OFF"
+        )
+        buttons.append([{"text": watcher_label, "callback_data": "claude:watcher_toggle"}])
+
         keyboard = {"inline_keyboard": buttons}
         return msg.strip(), keyboard
 
@@ -789,6 +811,21 @@ class TeleClaudeBot:
             self.claude.clear()
             text, keyboard = self._build_claude_menu()
             self.edit_message(message_id, "🗑 Session cleared.\n\n" + text, keyboard)
+
+        elif data == "claude:watcher_toggle":
+            if self._watcher_enabled:
+                self._stop_watcher()
+                self.send("🔕 <b>Usage-limit watcher disabled.</b>")
+            else:
+                self._start_watcher()
+                self.send(
+                    "🔔 <b>Usage-limit watcher enabled.</b>\n"
+                    "Probes Claude every <b>60m</b> while available, <b>15m</b> while rate-limited.\n"
+                    "I'll ping when your 5-hour usage window resets."
+                )
+            text, keyboard = self._build_claude_menu()
+            self.edit_message(message_id, text, keyboard)
+            return
 
         elif data == "claude:poll_stop":
             self._context_polling = False
@@ -964,6 +1001,122 @@ class TeleClaudeBot:
 
         self._context_poll_thread = threading.Thread(target=poll, daemon=True)
         self._context_poll_thread.start()
+
+    # -- Continuous availability watcher -----------------------------------
+
+    def _watcher_cleanup_session(self, session_id: str):
+        if not session_id:
+            return
+        root = Path.home() / ".claude" / "projects"
+        if not root.is_dir():
+            return
+        for p in root.rglob(f"{session_id}.jsonl"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    def _watcher_parse_reset(self, text: str) -> str:
+        """Extract reset time from Claude's limit message, e.g. 'resets 6:50pm (Asia/Jerusalem)'."""
+        import re
+        m = re.search(r"resets?\s+([0-9:apm\s]+(?:\([^)]+\))?)", text, re.IGNORECASE)
+        return m.group(1).strip() if m else ""
+
+    def _watcher_probe(self) -> tuple[bool, str, str]:
+        """Single probe. Returns (blocked, reset_hint, snippet)."""
+        try:
+            env = {**os.environ}
+            env.pop("CLAUDECODE", None)
+            r = subprocess.run(
+                ["claude", "--print", "--output-format", "json", "--max-turns", "1",
+                 "--model", "haiku", "-p", "hi"],
+                capture_output=True, text=True, timeout=60,
+                cwd=self._project_dir, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "", "timeout"
+        except Exception as e:
+            return False, "", f"err: {e!r}"
+
+        session_id = ""
+        api_err = None
+        is_err = False
+        result_text = ""
+        try:
+            data = json.loads(r.stdout)
+            session_id = data.get("session_id", "") or ""
+            api_err = data.get("api_error_status")
+            is_err = bool(data.get("is_error"))
+            result_text = (data.get("result") or "")[:160]
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        self._watcher_cleanup_session(session_id)
+
+        blocked = api_err == 429 or (is_err and "limit" in result_text.lower())
+        reset_hint = self._watcher_parse_reset(result_text) if blocked else ""
+        return blocked, reset_hint, f"api_err={api_err} is_err={is_err} :: {result_text}"
+
+    def _persist_watcher_state(self, enabled: bool):
+        try:
+            self._watcher_state_file.parent.mkdir(parents=True, exist_ok=True)
+            self._watcher_state_file.write_text("1" if enabled else "0")
+        except OSError as e:
+            print(f"[watcher] failed to persist state: {e!r}", flush=True)
+
+    def _start_watcher(self):
+        if self._watcher_enabled:
+            return
+        self._watcher_enabled = True
+        self._watcher_prev_blocked = None
+        self._persist_watcher_state(True)
+        print("[watcher] started (60m free / 15m blocked)", flush=True)
+
+        def loop():
+            interval_blocked = 15 * 60
+            interval_free = 60 * 60
+            last_reset_hint = ""
+            while self._watcher_enabled:
+                try:
+                    blocked, reset_hint, snippet = self._watcher_probe()
+                    state = "rate-limited" if blocked else "available"
+                    print(f"[watcher] {state}: {snippet}", flush=True)
+
+                    # First time we see a block, surface the reset time once.
+                    if blocked and self._watcher_prev_blocked is not True:
+                        msg = "🛑 <b>Claude usage limit reached</b> (rate-limited)."
+                        if reset_hint:
+                            msg += f"\n⏰ Resets: <b>{reset_hint}</b>"
+                        msg += "\n🔁 Polling every 15m until the window resets."
+                        self.send(msg)
+                        last_reset_hint = reset_hint
+
+                    if self._watcher_prev_blocked is True and not blocked:
+                        msg = "🟢 <b>Usage limit reset</b> — Claude is available again."
+                        if last_reset_hint:
+                            msg += f"\n<i>(was: resets {last_reset_hint})</i>"
+                        self.send(msg)
+                        print("[watcher] notified rate-limited -> available", flush=True)
+                        last_reset_hint = ""
+
+                    self._watcher_prev_blocked = blocked
+                except Exception as e:
+                    print(f"[watcher] probe error: {e!r}", flush=True)
+                # Sleep in 5s slices so toggle-off takes effect quickly
+                wait = interval_blocked if self._watcher_prev_blocked else interval_free
+                slept = 0
+                while self._watcher_enabled and slept < wait:
+                    time.sleep(5)
+                    slept += 5
+            print("[watcher] stopped", flush=True)
+            self._watcher_thread = None
+
+        self._watcher_thread = threading.Thread(target=loop, daemon=True)
+        self._watcher_thread.start()
+
+    def _stop_watcher(self):
+        self._watcher_enabled = False
+        self._persist_watcher_state(False)
 
     # -- Voice message handling --------------------------------------------
 
