@@ -179,6 +179,21 @@ class TeleClaudeBot(
 
     def _cmd_restart(self):
         self.send("🔄 Restarting...")
+        # Ack the current update batch before execv. Otherwise, if /restart was
+        # triggered via a callback button, Telegram has not yet seen the
+        # advanced offset (the polling loop never gets back to call getUpdates
+        # after the handler returns). After execv, last_update_id resets to 0,
+        # the same callback is redelivered, and the bot enters an infinite
+        # restart loop under any supervisor that respawns the process.
+        try:
+            import requests as _r
+            _r.get(
+                self.base_url + "/getUpdates",
+                params={"offset": self.last_update_id + 1, "timeout": 0},
+                timeout=5,
+            )
+        except Exception as _e:
+            print(f"[!] pre-restart Telegram ack failed: {_e}")
         self.on_restart()
 
     def _cmd_session(self):
