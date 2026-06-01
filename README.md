@@ -1,4 +1,3 @@
-
 <p align="center">
   <img src="assets/telegram.svg" alt="Telegram" height="80">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
   <img src="assets/claude.svg" alt="Claude Code" height="80">
@@ -6,9 +5,13 @@
 
 # TeleClaude
 
-**A Python framework for building Telegram bots that use [Claude Code](https://github.com/anthropics/claude-code) to read, plan, and edit their own codebase - with human-in-the-loop approval, voice transcription via OpenAI Whisper, and self-restarting deployment.**
+**Build Telegram apps that can be developed from Telegram.**
 
-<sub>`anthropic` `claude-code` `claude-code-channels` `telegram-bot` `ai-agent` `self-improving-software` `whisper` `voice-to-code` `agentic-coding` `python`</sub>
+TeleClaude is a Python base app for Telegram-first products that pair naturally with [Claude Code](https://github.com/anthropics/claude-code). You message your running bot, Claude Code reads the repo, proposes a plan, and you approve the change from Telegram. The bot can then restart and pick up the new code.
+
+It is useful when the product interface is Telegram, and you want the development loop to live there too.
+
+<sub>`anthropic` `claude-code` `telegram-bot` `ai-agent` `human-in-the-loop` `whisper` `voice-to-code` `agentic-coding` `python`</sub>
 
 <p align="center">
   <a href="https://pypi.org/project/teleclaude/"><img src="https://img.shields.io/pypi/v/teleclaude?color=blue" alt="PyPI"></a>
@@ -18,15 +21,33 @@
 
 ---
 
-## The idea: let Claude Code edit itself through Telegram
+## Why this exists
 
-Your bot is a thin Telegram relay. **[Claude Code](https://github.com/anthropics/claude-code) is the agentic part** - it reads the codebase, proposes changes, and writes files when you approve. The bot just forwards your messages to Claude Code and sends back the response.
+I kept building small Telegram apps and wanted a smoother loop:
 
-The result is a **closed-loop development cycle**: `chat -> analyze -> plan -> approve -> edit -> restart`. No IDE, no SSH, no deploy pipeline. Just a conversation with your running application from your phone - or even a voice message transcribed via [Whisper](https://github.com/openai/whisper).
+1. Ask the running app for a change
+2. Let Claude Code inspect the repo
+3. Review the plan in Telegram
+4. Approve or reject the edit
+5. Restart the bot when the change is ready
 
-**What about [Claude Code Channels](https://docs.anthropic.com/en/docs/claude-code/channels)?** Anthropic's official Telegram/Discord/iMessage channels are a promising direction, but they're still in research preview - when we last tested them, the experience wasn't stable enough for production use. TeleClaude was built to fill that gap: your bot runs Claude Code as a subprocess on the server where it's deployed, with a plan/approve workflow and self-restart baked in. No local machine needed, no `--channels` flag, no Bun dependency - just `pip install` and go. If Channels matures into a solid production path, we'd love to add it as an alternative backend - [contributions welcome](https://github.com/ofir5300/teleclaude/issues).
+For many changes, that means no SSH session and no IDE round-trip. Just a controlled Claude Code workflow from the same place the app already lives.
 
-<img src="assets/claude-bot.png" alt="Claude Bot" width="60">
+TeleClaude is the base layer for that workflow: a Telegram bot framework, a Claude Code session wrapper, a plan/approve flow, and a few practical controls for running bots in the wild.
+
+<a href="assets/example-from-polybot.png"><img src="assets/example-from-polybot.png" alt="Claude control example from PolyBot" width="420"></a>
+
+## What you get
+
+- **Telegram interface for Claude Code** - send free text or voice messages to your running app.
+- **Read-only planning before edits** - Claude Code analyzes first, then waits for approval.
+- **Approve/reject from Telegram** - keep a human in the loop before files change.
+- **Session controls** - pin, clear, flush, and hand off context between Claude Code sessions.
+- **Model switching** - choose Opus, Sonnet, or Haiku from the bot menu.
+- **Context visibility** - see usage stats and get notified when the rolling context window refreshes.
+- **Voice messages** - optional Whisper transcription for voice-to-Claude workflows.
+- **Self-restart** - restart the bot process after changes so the running app picks up the new code.
+- **Custom commands** - subclass the base bot and add your own Telegram commands.
 
 ## How it works
 
@@ -40,17 +61,18 @@ The result is a **closed-loop development cycle**: `chat -> analyze -> plan -> a
 +----------------+        +-----------------+        +--------------------+
 ```
 
-<a href="assets/example-from-polybot.png"><img align="right" src="assets/example-from-polybot.png" alt="Claude control example from PolyBot" height="190"></a>
+Example flow:
 
-1. You send a message in Telegram
-2. TeleClaude routes it to Claude Code in **read-only plan mode**
-3. Claude analyzes your codebase and proposes a plan
-4. You `/approve` or `/reject` from Telegram
-5. On approve, Claude executes with file-edit permissions
-6. `/restart` reloads the bot to pick up code changes
-7. The application is now running its improved version of itself
+```text
+You: add a /status command that shows the last 5 git commits
+Claude: reads the repo and proposes a plan
+You: /approve
+Claude: edits the files
+You: /restart
+Bot: running with the new /status command
+```
 
-<br clear="right">
+The important bit is that Claude Code does not get write access by default. Normal messages run in read-only plan mode. File edits only happen after you approve the pending plan.
 
 ## Quickstart
 
@@ -91,27 +113,29 @@ except KeyboardInterrupt:
     bot.stop_polling()
 ```
 
-That's it. Send any message in Telegram and Claude Code responds. Built-in commands:
+Send any message in Telegram and Claude Code responds.
 
-| Command     | What it does                                                        |
-| ----------- | ------------------------------------------------------------------- |
-| Free text   | Chat with Claude Code (read-only mode)                              |
-| Voice msg   | Transcribed via Whisper, then routed to Claude                      |
+## Built-in commands
+
+| Command     | What it does                                                          |
+| ----------- | --------------------------------------------------------------------- |
+| Free text   | Chat with Claude Code in read-only plan mode                          |
+| Voice msg   | Transcribed via Whisper, then routed to Claude Code                   |
 | `/claude`   | Interactive menu: model switcher, session info, flush, approve/reject |
-| `/approve`  | Execute Claude's pending plan (allows file edits)                   |
-| `/reject`   | Discard the pending plan                                            |
-| `/session`  | Session management (`/session pin <id>`, `/session clear`)          |
-| `/context`  | Check Claude Code availability (rate-limit detection)               |
-| `/restart`  | Restart the bot process (picks up code changes)                     |
-| `/help`     | Show all available commands                                         |
+| `/approve`  | Execute Claude's pending plan with file-edit permissions              |
+| `/reject`   | Discard the pending plan                                              |
+| `/session`  | Session management (`/session pin <id>`, `/session clear`)            |
+| `/context`  | Check Claude Code availability and context usage                      |
+| `/restart`  | Restart the bot process so code changes take effect                   |
+| `/help`     | Show all available commands                                           |
 
-### Add your own commands
+## Add your own commands
 
 Subclass `TeleClaudeBot` and override `domain_commands()` to register custom `/commands`:
 
 ```python
 import subprocess
-from teleclaude import ClaudeSession, TeleClaudeBot, kill_previous
+from teleclaude import TeleClaudeBot
 
 class MyBot(TeleClaudeBot):
     def domain_commands(self):
@@ -140,20 +164,21 @@ Other hooks you can override:
 
 ### Voice messages
 
-Send a voice message in Telegram and it gets auto-transcribed via [OpenAI Whisper](https://github.com/openai/whisper), then routed to Claude. Install the optional dependency:
+Send a voice message in Telegram and TeleClaude transcribes it with [OpenAI Whisper](https://github.com/openai/whisper), then routes the text to Claude Code. Install the optional dependency:
 
 ```bash
 pip install openai-whisper
 ```
 
-The Whisper model (`base`) is lazy-loaded on first voice message. If not installed, the bot replies with install instructions.
+The Whisper model (`base`) is lazy-loaded on first voice message. If Whisper is not installed, the bot replies with install instructions.
 
 ### Session handoff
 
 The `/claude` menu includes **Flush & New Session**, which:
+
 1. Asks Claude to write a `.handoff.md` summary of the current session context
 2. Clears the session pin
-3. On the next message, a new session bootstraps from `.handoff.md` automatically
+3. Bootstraps the next session from `.handoff.md`
 
 To enable automatic handoff bootstrap, pass `bootstrap_file` to `ClaudeSession`:
 
@@ -163,7 +188,13 @@ session = ClaudeSession(project_dir=".", bootstrap_file=".handoff.md")
 
 ### Rate-limit detection
 
-When Claude returns a rate-limit error, the bot automatically starts background polling (every 5 min, up to 12 h) and notifies you when Claude is back online. You can also manually check via `/context` or the `/claude` menu.
+When Claude returns a rate-limit error, the bot starts background polling every 5 minutes for up to 12 hours and notifies you when Claude is back online. You can also check manually with `/context` or the `/claude` menu.
+
+### Why not Claude Code Channels?
+
+[Claude Code Channels](https://docs.anthropic.com/en/docs/claude-code/channels) is Anthropic's official direction for connecting Claude Code to Telegram, Discord, and iMessage. It is promising, but when this project started it was still a research-preview path and not stable enough for the bots I was running.
+
+TeleClaude takes a simpler approach: your bot runs Claude Code as a subprocess on the same server where the app is deployed. No local machine needs to stay open, no `--channels` flag, and no Bun dependency. If Channels becomes the right production backend later, TeleClaude can add it behind the same session interface.
 
 ## Configuration reference
 
@@ -195,9 +226,11 @@ cd example && cp .env.example .env  # fill in your tokens
 python main.py
 ```
 
-## Contributing
+## Project status
 
-Contributions welcome! Open an issue or PR on [GitHub](https://github.com/ofir5300/teleclaude).
+TeleClaude is usable, packaged on PyPI, and already extracted from real Telegram bots. It is still early. Expect some rough edges around deployment style, Claude Code CLI behavior, and long-running bot operations.
+
+If you are building Telegram-first tools with Claude Code, try it on a small bot and open an issue with what breaks. Real bot feedback is more useful than polished guesses.
 
 ## License
 
