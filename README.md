@@ -35,7 +35,13 @@ For many changes, that means no SSH session and no IDE round-trip. Just a contro
 
 TeleClaude is the base layer for that workflow: a Telegram bot framework, a Claude Code session wrapper, a plan/approve flow, and a few practical controls for running bots in the wild.
 
-<a href="assets/example-from-polybot.png"><img src="assets/example-from-polybot.png" alt="Claude control example from PolyBot" width="420"></a>
+## Demo
+
+<p align="center">
+  <a href="assets/example-from-polybot.png"><img src="assets/example-from-polybot.png" alt="Claude Code control menu inside a running Telegram bot" width="360"></a>
+</p>
+
+<p align="center"><sub>Claude Code controls inside a running Telegram app: model, session, availability, flush, restart, and usage-limit watcher.</sub></p>
 
 ## What you get
 
@@ -44,7 +50,8 @@ TeleClaude is the base layer for that workflow: a Telegram bot framework, a Clau
 - **Approve/reject from Telegram** - keep a human in the loop before files change.
 - **Session controls** - pin, clear, flush, and hand off context between Claude Code sessions.
 - **Model switching** - choose Opus, Sonnet, or Haiku from the bot menu.
-- **Context visibility** - see usage stats and get notified when the rolling context window refreshes.
+- **Context window visibility** - see token usage, trend, peak, and estimated turns remaining from Telegram.
+- **Usage-limit reset watcher** - get a Telegram alert when Claude Code's usage window resets. This alone can be useful as a Claude Code notifier.
 - **Voice messages** - optional Whisper transcription for voice-to-Claude workflows.
 - **Self-restart** - restart the bot process after changes so the running app picks up the new code.
 - **Custom commands** - subclass the base bot and add your own Telegram commands.
@@ -66,9 +73,9 @@ Example flow:
 ```text
 You: add a /status command that shows the last 5 git commits
 Claude: reads the repo and proposes a plan
-You: /approve
+You: tap Approve Plan in the /claude menu (or send /approve)
 Claude: edits the files
-You: /restart
+You: tap Restart Bot in the /claude menu (or send /restart)
 Bot: running with the new /status command
 ```
 
@@ -121,12 +128,13 @@ Send any message in Telegram and Claude Code responds.
 | ----------- | --------------------------------------------------------------------- |
 | Free text   | Chat with Claude Code in read-only plan mode                          |
 | Voice msg   | Transcribed via Whisper, then routed to Claude Code                   |
-| `/claude`   | Interactive menu: model switcher, session info, flush, approve/reject |
-| `/approve`  | Execute Claude's pending plan with file-edit permissions              |
-| `/reject`   | Discard the pending plan                                              |
+| `/claude`   | Interactive menu: availability, model, session, flush, approve/reject, watcher, restart |
+| `/approve`  | Execute Claude's pending plan with file-edit permissions; also available in the menu |
+| `/reject`   | Discard the pending plan; also available in the menu                  |
 | `/session`  | Session management (`/session pin <id>`, `/session clear`)            |
-| `/context`  | Check Claude Code availability and context usage                      |
-| `/restart`  | Restart the bot process so code changes take effect                   |
+| `/context`  | Check Claude Code availability and context usage; also available in the menu |
+| Watcher     | Toggle from `/claude`; pings when Claude Code's usage-limit window resets |
+| `/restart`  | Restart the bot process so code changes take effect; also available in the menu |
 | `/help`     | Show all available commands                                           |
 
 ## Add your own commands
@@ -162,6 +170,14 @@ Other hooks you can override:
 
 ## Features
 
+### Context window telemetry
+
+TeleClaude parses Claude Code's JSON output and surfaces useful session stats in Telegram: cost, turns, token usage, context-window percentage, trend, peak usage, average growth, and estimated turns remaining. You do not need to open a terminal just to know whether the current Claude Code session is getting crowded.
+
+### Usage-limit reset watcher
+
+The `/claude` menu includes a persistent usage-limit watcher. When enabled, it probes Claude Code in the background, detects rate-limit windows, and sends a Telegram alert when the window resets. Even if you are not using TeleClaude as a full bot framework yet, this can be useful as a lightweight Claude Code availability notifier.
+
 ### Voice messages
 
 Send a voice message in Telegram and TeleClaude transcribes it with [OpenAI Whisper](https://github.com/openai/whisper), then routes the text to Claude Code. Install the optional dependency:
@@ -189,6 +205,16 @@ session = ClaudeSession(project_dir=".", bootstrap_file=".handoff.md")
 ### Rate-limit detection
 
 When Claude returns a rate-limit error, the bot starts background polling every 5 minutes for up to 12 hours and notifies you when Claude is back online. You can also check manually with `/context` or the `/claude` menu.
+
+## If you are an agent reading this
+
+TeleClaude is a base app/framework, not a finished single-purpose bot. If you are Claude Code or another coding agent evaluating this repo:
+
+- Start with `teleclaude/base_bot.py` for the Telegram app surface.
+- Use `teleclaude/session_cli.py` for the Claude Code subprocess/session wrapper.
+- Extend behavior through `domain_commands()`, `on_domain_callback()`, `help_text()`, `on_restart()`, and `plan_prompt_wrapper()` instead of patching the base flow.
+- Preserve the plan/approve/reject safety model: free text should plan first; edits happen only after approval.
+- Treat `/claude` as the primary control surface; several direct commands also exist as menu buttons.
 
 ### Why not Claude Code Channels?
 
@@ -230,7 +256,7 @@ python main.py
 
 TeleClaude is usable, packaged on PyPI, and already extracted from real Telegram bots. It is still early. Expect some rough edges around deployment style, Claude Code CLI behavior, and long-running bot operations.
 
-If you are building Telegram-first tools with Claude Code, try it on a small bot and open an issue with what breaks. Real bot feedback is more useful than polished guesses.
+If you are building Telegram-first tools with Claude Code, try it on a small bot and open an issue with what breaks. Contributions are welcome, especially from people running real bots: bug reports, docs fixes, screenshots/GIFs, and small framework improvements are all useful signal.
 
 ## License
 
