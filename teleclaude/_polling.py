@@ -12,6 +12,15 @@ class PollingMixin:
         self.running = True
         self._register_commands()
 
+        try:
+            pending = self.get_updates(timeout=0)
+            if pending:
+                self.last_update_id = max(u["update_id"] for u in pending)
+                self.get_updates(timeout=0)
+                print(f"[i] Telegram: drained {len(pending)} stale update(s) on startup", flush=True)
+        except Exception as e:
+            print(f"[!] Telegram drain failed: {e}", flush=True)
+
         def poll_loop():
             print("[i] Telegram command listener started", flush=True)
             while self.running:
@@ -115,7 +124,7 @@ class PollingMixin:
             bot_commands.append({"command": cmd.lstrip("/"), "description": desc})
 
         try:
-            import requests as _requests
+            from teleclaude._telegram import _request_with_retry
 
             for scope in [
                 None,
@@ -124,15 +133,15 @@ class PollingMixin:
                 {"type": "all_chat_administrators"},
             ]:
                 payload = {"scope": scope} if scope else {}
-                dr = _requests.post(f"{self.base_url}/deleteMyCommands", json=payload, timeout=10)
+                dr = _request_with_retry("POST", f"{self.base_url}/deleteMyCommands", json=payload, timeout=10)
                 label = scope["type"] if scope else "default"
                 print(f"[cmd-reg] deleteMyCommands({label}): {dr.status_code}", flush=True)
 
             url = f"{self.base_url}/setMyCommands"
-            resp = _requests.post(url, json={"commands": bot_commands}, timeout=10)
+            resp = _request_with_retry("POST", url, json={"commands": bot_commands}, timeout=10)
             print(f"[cmd-reg] setMyCommands: {resp.status_code} {resp.json()}", flush=True)
 
-            get_resp = _requests.post(f"{self.base_url}/getMyCommands", timeout=10)
+            get_resp = _request_with_retry("POST", f"{self.base_url}/getMyCommands", timeout=10)
             registered = get_resp.json()
             print(f"[cmd-reg] getMyCommands: {len(registered.get('result', []))} commands: {registered}", flush=True)
 
