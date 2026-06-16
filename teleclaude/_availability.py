@@ -6,7 +6,13 @@ import re
 import subprocess
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None  # type: ignore
 
 
 class AvailabilityMixin:
@@ -110,9 +116,51 @@ class AvailabilityMixin:
                 pass
 
     def _watcher_parse_reset(self, text: str) -> str:
-        """Extract reset time from Claude's limit message, e.g. 'resets 6:50pm (Asia/Jerusalem)'."""
-        m = re.search(r"resets?\s+([0-9:apm\s]+(?:\([^)]+\))?)", text, re.IGNORECASE)
-        return m.group(1).strip() if m else ""
+        """Extract reset hint from Claude's limit message.
+
+        Handles both 5-hour ('resets 6:50pm (Asia/Jerusalem)') and weekly
+        ('resets May 13 6:50pm', 'resets Wednesday 6:50pm') forms by capturing
+        everything after 'resets' up to a sentence terminator. Display-only —
+        we no longer derive sleep timing from it.
+        """
+        m = re.search(r"resets?\s+([^.\n;|]+)", text, re.IGNORECASE)
+        if not m:
+            return ""
+        hint = m.group(1).strip().rstrip(",")
+        return hint[:80]
+
+    def _watcher_seconds_until_reset(self, hint: str) -> int | None:
+        """Parse 'h:mm[am|pm] (Tz)' into seconds-from-now. None if unparseable."""
+        if not hint:
+            return None
+        m = re.match(
+            r"(\d{1,2})(?::(\d{2}))?\s*([apAP][mM])\s*(?:\(([^)]+)\))?",
+            hint.strip(),
+        )
+        if not m:
+            return None
+        hour = int(m.group(1))
+        minute = int(m.group(2) or 0)
+        ampm = m.group(3).lower()
+        tzname = (m.group(4) or "").strip()
+
+        if ampm == "pm" and hour < 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+
+        tz = None
+        if tzname and ZoneInfo is not None:
+            try:
+                tz = ZoneInfo(tzname)
+            except Exception:
+                tz = None
+
+        now = datetime.now(tz) if tz else datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        return int((target - now).total_seconds())
 
     def _watcher_probe(self) -> tuple[bool, str, str]:
         """Single probe. Returns (blocked, reset_hint, snippet)."""
@@ -164,10 +212,17 @@ class AvailabilityMixin:
         self._persist_watcher_state(True)
         print("[watcher] started (60m free / 15m blocked)", flush=True)
 
+        def interruptible_sleep(total: int):
+            slept = 0
+            while self._watcher_enabled and slept < total:
+                time.sleep(5)
+                slept += 5
+
         def loop():
-            interval_blocked = 15 * 60
             interval_free = 60 * 60
-            last_reset_hint = ""
+            fallback_blocked = 15 * 60
+            grace = 60  # seconds after reset before re-probing
+
             while self._watcher_enabled:
                 try:
                     blocked, reset_hint, snippet = self._watcher_probe()
@@ -178,26 +233,36 @@ class AvailabilityMixin:
                         msg = "🛑 <b>Claude usage limit reached</b> (rate-limited)."
                         if reset_hint:
                             msg += f"\n⏰ Resets: <b>{reset_hint}</b>"
-                        msg += "\n🔁 Polling every 15m until the window resets."
+                        msg += "\nI'll notify you when it resets."
                         self.send(msg)
-                        last_reset_hint = reset_hint
+                        self._watcher_last_reset_hint = reset_hint
 
                     if self._watcher_prev_blocked is True and not blocked:
                         msg = "🟢 <b>Usage limit reset</b> — Claude is available again."
-                        if last_reset_hint:
-                            msg += f"\n<i>(was: resets {last_reset_hint})</i>"
+                        if self._watcher_last_reset_hint:
+                            msg += f"\n<i>(was: resets {self._watcher_last_reset_hint})</i>"
                         self.send(msg)
                         print("[watcher] notified rate-limited -> available", flush=True)
-                        last_reset_hint = ""
+                        self._watcher_last_reset_hint = ""
 
                     self._watcher_prev_blocked = blocked
                 except Exception as e:
                     print(f"[watcher] probe error: {e!r}", flush=True)
-                wait = interval_blocked if self._watcher_prev_blocked else interval_free
-                slept = 0
-                while self._watcher_enabled and slept < wait:
-                    time.sleep(5)
-                    slept += 5
+                    blocked = self._watcher_prev_blocked or False
+                    reset_hint = ""
+
+                # Decide next sleep duration:
+                # - free: 60m
+                # - blocked + parsable reset: sleep until reset + grace
+                # - blocked + unparsable: fall back to 15m polling
+                if not blocked:
+                    wait = interval_free
+                else:
+                    secs = self._watcher_seconds_until_reset(reset_hint or self._watcher_last_reset_hint)
+                    wait = (secs + grace) if secs is not None else fallback_blocked
+                print(f"[watcher] next probe in {wait}s", flush=True)
+                interruptible_sleep(wait)
+
             print("[watcher] stopped", flush=True)
             self._watcher_thread = None
 

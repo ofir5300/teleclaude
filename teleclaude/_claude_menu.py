@@ -18,8 +18,26 @@ class ClaudeMenuMixin:
 
     def _build_claude_menu(self):
         """Build the Claude Code main menu. Returns (text, keyboard)."""
-        status_icon = "🔴" if self._claude_busy else "🟢"
-        status_text = "Busy" if self._claude_busy else "Available"
+        # Status reflects (in priority): watcher-detected rate-limit > active subprocess > idle.
+        if self._watcher_enabled and self._watcher_prev_blocked is True:
+            status_icon = "🛑"
+            status_text = "Rate-limited"
+            if self._watcher_last_reset_hint:
+                secs = self._watcher_seconds_until_reset(self._watcher_last_reset_hint)
+                if secs is not None and secs > 0:
+                    if secs >= 3600:
+                        eta = f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+                    else:
+                        eta = f"{max(1, secs // 60)}m"
+                    status_text = f"Rate-limited (resets {self._watcher_last_reset_hint} · in {eta})"
+                else:
+                    status_text = f"Rate-limited (resets {self._watcher_last_reset_hint})"
+        elif self._claude_busy:
+            status_icon = "🔴"
+            status_text = "Busy"
+        else:
+            status_icon = "🟢"
+            status_text = "Available"
         polling_text = " | 📡 Polling" if self._context_polling else ""
 
         if self.claude.session_name:
@@ -218,8 +236,7 @@ class ClaudeMenuMixin:
                 self._start_watcher()
                 self.send(
                     "🔔 <b>Usage-limit watcher enabled.</b>\n"
-                    "Probes Claude every <b>60m</b> while available, <b>15m</b> while rate-limited.\n"
-                    "I'll ping when your 5-hour usage window resets."
+                    "I'll notify you when your Claude usage window resets."
                 )
             text, keyboard = self._build_claude_menu()
             self.edit_message(message_id, text, keyboard)

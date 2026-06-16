@@ -14,6 +14,7 @@ Implementation is split across mixins for readability:
 
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Callable
@@ -87,12 +88,15 @@ class TeleClaudeBot(
         self._context_poll_thread = None
 
         # Continuous availability watcher (toggleable from /claude menu).
-        # Probes every 60m while free, 15m while blocked; alerts on blocked->free transitions.
-        # Toggle state persists across restarts via ~/.teleclaude/watcher_enabled.
-        self._watcher_state_file = Path.home() / ".teleclaude" / "watcher_enabled"
+        # Alerts on rate-limited -> available transitions; persists across restarts.
+        # State is scoped per chat_id so multiple teleclaude bots on the same machine
+        # don't share toggle state, double-probe the API, or send duplicate pings.
+        _scope = re.sub(r"[^A-Za-z0-9_-]", "_", str(self.chat_id) or "default")
+        self._watcher_state_file = Path.home() / ".teleclaude" / f"watcher_{_scope}"
         self._watcher_enabled = False
         self._watcher_thread = None
         self._watcher_prev_blocked: bool | None = None
+        self._watcher_last_reset_hint: str = ""
         if self._watcher_state_file.exists():
             try:
                 if self._watcher_state_file.read_text().strip() == "1":
