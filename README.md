@@ -39,6 +39,8 @@ TeleClaude is the base layer for that workflow: a Telegram bot framework, a Clau
 
 <p align="center">
   <a href="assets/example-from-polybot.png"><img src="assets/example-from-polybot.png" alt="Claude Code control menu inside a running Telegram bot" width="360"></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="assets/example-from-polybot.png"><img src="assets/polybot.gif" alt="Claude Code control menu inside a running Telegram bot" width="360"></a>
 </p>
 
 <p align="center"><sub>Claude Code controls inside a running Telegram app: model, session, availability, flush, restart, and usage-limit watcher.</sub></p>
