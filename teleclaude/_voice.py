@@ -18,33 +18,38 @@ class VoiceMixin:
 
         def transcribe():
             try:
-                import requests as _requests
+                from teleclaude._telegram import _request_with_retry
 
-                file_info = _requests.get(f"{self.base_url}/getFile", params={"file_id": file_id}).json()
+                file_info = _request_with_retry(
+                    "GET", f"{self.base_url}/getFile",
+                    params={"file_id": file_id}, timeout=15,
+                ).json()
                 file_path = file_info.get("result", {}).get("file_path", "")
                 if not file_path:
                     self.send("Failed to get voice file from Telegram.")
                     return
 
                 download_url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
-                audio_data = _requests.get(download_url).content
+                audio_data = _request_with_retry("GET", download_url, timeout=60).content
 
                 with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
                     tmp.write(audio_data)
                     tmp_path = tmp.name
 
-                if self._whisper_model is None:
-                    import whisper
-
-                    self._whisper_model = whisper.load_model("base")
-
-                result = self._whisper_model.transcribe(tmp_path)
-                text = result.get("text", "").strip()
-
                 try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
+                    if self._whisper_model is None:
+                        import whisper
+
+                        self._whisper_model = whisper.load_model("base")
+
+                    result = self._whisper_model.transcribe(tmp_path)
+                    text = result.get("text", "").strip()
+                finally:
+                    # Always remove the temp audio, including when whisper raises.
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
 
                 if not text:
                     self.send("Could not transcribe audio (empty result).")

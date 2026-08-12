@@ -35,6 +35,18 @@ dev = ["ruff", "pytest"]
 [tool.setuptools.packages.find]
 include = ["teleclaude*"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]  # long lines are mostly Telegram message strings
+
 [tool.setuptools_scm]
 # Version derived from git tags (vX.Y.Z). Tag the commit, push, CI publishes.
 # No version field anywhere in source — single source of truth is the git tag.

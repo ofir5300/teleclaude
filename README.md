@@ -180,6 +180,11 @@ TeleClaude parses Claude Code's JSON output and surfaces useful session stats in
 
 The `/claude` menu includes a persistent usage-limit watcher. When enabled, it probes Claude Code in the background, detects rate-limit windows, and sends a Telegram alert when the window resets. Even if you are not using TeleClaude as a full bot framework yet, this can be useful as a lightweight Claude Code availability notifier.
 
+- The probe is one Haiku turn, so watching costs close to nothing
+- While you have quota it probes hourly; once blocked it parses the reset time out of Claude's message and sleeps until then (+1 min grace) instead of polling blind
+- The toggle persists under `~/.teleclaude/watcher_<chat_id>`, so it survives `/restart` and is scoped per chat - several bots on one machine will not double-probe or double-notify
+- A failed probe (timeout, CLI error) counts as *unknown*, not "available", so a flaky probe cannot fake a reset alert
+
 ### Voice messages
 
 Send a voice message in Telegram and TeleClaude transcribes it with [OpenAI Whisper](https://github.com/openai/whisper), then routes the text to Claude Code. Install the optional dependency:
@@ -207,6 +212,10 @@ session = ClaudeSession(project_dir=".", bootstrap_file=".handoff.md")
 ### Rate-limit detection
 
 When Claude returns a rate-limit error, the bot starts background polling every 5 minutes for up to 12 hours and notifies you when Claude is back online. You can also check manually with `/context` or the `/claude` menu.
+
+### Restart safety
+
+`/restart` acks the current update batch with Telegram before `os.execv`, so a restart triggered from an inline button is not redelivered once the process comes back - otherwise a supervisor (launchd, systemd) would loop it forever. Under launchd, `kill_previous()` is a no-op: `KeepAlive` already guarantees a single instance, and the PID-file dance would only risk SIGTERMing a healthy sibling.
 
 ## If you are an agent reading this
 
@@ -249,10 +258,14 @@ session = ClaudeSession(
 ```bash
 git clone https://github.com/ofir5300/teleclaude.git
 cd teleclaude
-pip install -e .
+pip install -e ".[dev]"
+pytest                              # test suite: no network, no claude CLI needed
+ruff check .
 cd example && cp .env.example .env  # fill in your tokens
 python main.py
 ```
+
+Releases are cut from git tags - `git tag vX.Y.Z && git push --tags` builds, publishes to PyPI, and creates the GitHub Release. There is no version string in the source; setuptools-scm derives it from the tag.
 
 ## Project status
 

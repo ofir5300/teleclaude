@@ -55,9 +55,10 @@ class PollingMixin:
         if uid is not None:
             if uid in self._seen_update_ids:
                 return  # Telegram re-delivery — skip
+            if len(self._seen_update_order) == self._seen_update_order.maxlen:
+                self._seen_update_ids.discard(self._seen_update_order[0])
+            self._seen_update_order.append(uid)
             self._seen_update_ids.add(uid)
-            if len(self._seen_update_ids) > 200:
-                self._seen_update_ids.discard(min(self._seen_update_ids))
             self.last_update_id = uid
 
         callback = update.get("callback_query")

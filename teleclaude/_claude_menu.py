@@ -1,7 +1,5 @@
 """/claude inline-keyboard menu and session view."""
 
-import os
-import subprocess
 import threading
 from pathlib import Path
 
@@ -182,25 +180,7 @@ class ClaudeMenuMixin:
             self.edit_message(message_id, "🔍 Checking Claude Code availability...")
 
             def check_and_update():
-                try:
-                    env = {**os.environ}
-                    env.pop("CLAUDECODE", None)
-                    result = subprocess.run(
-                        ["claude", "--print", "--output-format", "json", "--max-turns", "1",
-                         "-p", "Reply with exactly: ok"],
-                        capture_output=True, text=True, timeout=30,
-                        cwd=self._project_dir, env=env,
-                    )
-                    if result.returncode == 0:
-                        status = "✅ Claude Code is <b>available</b>!"
-                    else:
-                        stderr = (result.stderr or "").strip()[:200]
-                        status = f"⏳ Claude Code <b>unavailable</b>\n<code>{stderr}</code>"
-                except subprocess.TimeoutExpired:
-                    status = "⏳ Claude Code <b>timed out</b> (may be rate-limited)"
-                except Exception as e:
-                    status = f"❌ Error: {str(e)[:200]}"
-
+                _available, status = self._probe_status("check")
                 keyboard = {"inline_keyboard": [[{"text": "⬅ Back to Claude Menu", "callback_data": "claude:menu"}]]}
                 self.edit_message(message_id, status, keyboard)
 
