@@ -1,7 +1,5 @@
 """/claude inline-keyboard menu and session view."""
 
-import os
-import subprocess
 import threading
 from pathlib import Path
 
@@ -18,8 +16,26 @@ class ClaudeMenuMixin:
 
     def _build_claude_menu(self):
         """Build the Claude Code main menu. Returns (text, keyboard)."""
-        status_icon = "🔴" if self._claude_busy else "🟢"
-        status_text = "Busy" if self._claude_busy else "Available"
+        # Status reflects (in priority): watcher-detected rate-limit > active subprocess > idle.
+        if self._watcher_enabled and self._watcher_prev_blocked is True:
+            status_icon = "🛑"
+            status_text = "Rate-limited"
+            if self._watcher_last_reset_hint:
+                secs = self._watcher_seconds_until_reset(self._watcher_last_reset_hint)
+                if secs is not None and secs > 0:
+                    if secs >= 3600:
+                        eta = f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+                    else:
+                        eta = f"{max(1, secs // 60)}m"
+                    status_text = f"Rate-limited (resets {self._watcher_last_reset_hint} · in {eta})"
+                else:
+                    status_text = f"Rate-limited (resets {self._watcher_last_reset_hint})"
+        elif self._claude_busy:
+            status_icon = "🔴"
+            status_text = "Busy"
+        else:
+            status_icon = "🟢"
+            status_text = "Available"
         polling_text = " | 📡 Polling" if self._context_polling else ""
 
         if self.claude.session_name:
@@ -108,7 +124,7 @@ class ClaudeMenuMixin:
 
         s = self.claude.stats
         if s.total_turns > 0:
-            msg += f"\n<b>📊 Session Stats</b>\n"
+            msg += "\n<b>📊 Session Stats</b>\n"
             msg += f"🔄 Turns: {s.total_turns}\n"
             msg += f"💰 Cost: ${s.total_cost_usd:.4f}\n"
             msg += f"⏱ Duration: {s.total_duration_ms / 1000:.1f}s\n"
@@ -116,7 +132,7 @@ class ClaudeMenuMixin:
             msg += f"💾 Cache: {s.total_cache_read_tokens:,} read / {s.total_cache_creation_tokens:,} created\n"
             pct = self.claude.context_pct
             if pct is not None:
-                msg += f"\n<b>📊 Context Window</b>\n"
+                msg += "\n<b>📊 Context Window</b>\n"
                 filled = int(pct / 10)
                 bar = "█" * filled + "░" * (10 - filled)
                 warn = " ⚠️" if pct > 80 else ""
@@ -142,7 +158,7 @@ class ClaudeMenuMixin:
                             time_str = f" ≈ {time_left}s"
                     msg += f"└ Remaining: ~{est} turns{time_str}\n"
                 elif pct > 80:
-                    msg += f"└ ⚠️ Consider flushing session\n"
+                    msg += "└ ⚠️ Consider flushing session\n"
 
         msg += "\n<i>To pin a new session, send:</i>\n<code>/session pin &lt;session_id&gt;</code>"
 
@@ -164,25 +180,7 @@ class ClaudeMenuMixin:
             self.edit_message(message_id, "🔍 Checking Claude Code availability...")
 
             def check_and_update():
-                try:
-                    env = {**os.environ}
-                    env.pop("CLAUDECODE", None)
-                    result = subprocess.run(
-                        ["claude", "--print", "--output-format", "json", "--max-turns", "1",
-                         "-p", "Reply with exactly: ok"],
-                        capture_output=True, text=True, timeout=30,
-                        cwd=self._project_dir, env=env,
-                    )
-                    if result.returncode == 0:
-                        status = "✅ Claude Code is <b>available</b>!"
-                    else:
-                        stderr = (result.stderr or "").strip()[:200]
-                        status = f"⏳ Claude Code <b>unavailable</b>\n<code>{stderr}</code>"
-                except subprocess.TimeoutExpired:
-                    status = "⏳ Claude Code <b>timed out</b> (may be rate-limited)"
-                except Exception as e:
-                    status = f"❌ Error: {str(e)[:200]}"
-
+                _available, status = self._probe_status("check")
                 keyboard = {"inline_keyboard": [[{"text": "⬅ Back to Claude Menu", "callback_data": "claude:menu"}]]}
                 self.edit_message(message_id, status, keyboard)
 
@@ -218,8 +216,7 @@ class ClaudeMenuMixin:
                 self._start_watcher()
                 self.send(
                     "🔔 <b>Usage-limit watcher enabled.</b>\n"
-                    "Probes Claude every <b>60m</b> while available, <b>15m</b> while rate-limited.\n"
-                    "I'll ping when your 5-hour usage window resets."
+                    "I'll notify you when your Claude usage window resets."
                 )
             text, keyboard = self._build_claude_menu()
             self.edit_message(message_id, text, keyboard)

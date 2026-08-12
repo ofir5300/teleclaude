@@ -6,49 +6,72 @@ import re
 import subprocess
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None  # type: ignore
+
+# One-turn ping used by every availability check. Haiku keeps the probe cheap.
+_PROBE_CMD = [
+    "claude", "--print", "--output-format", "json", "--max-turns", "1",
+    "--model", "haiku", "-p", "hi",
+]
 
 
 class AvailabilityMixin:
     """Three flavors of Claude availability tracking:
 
     - /context: one-shot check
-    - context polling: short-lived, auto-started on rate-limit error
+    - context polling: short-lived, auto-started on rate-limit
     - watcher: long-lived, user-toggled, persistent across restarts
     """
+
+    # -- shared probe ------------------------------------------------------
+
+    def _run_probe(self, timeout: int = 30) -> subprocess.CompletedProcess:
+        """Run the availability probe. Raises subprocess.TimeoutExpired on timeout."""
+        env = {**os.environ}
+        env.pop("CLAUDECODE", None)  # allow nested claude invocation
+        return subprocess.run(
+            _PROBE_CMD, capture_output=True, text=True,
+            timeout=timeout, cwd=self._project_dir, env=env,
+        )
+
+    def _probe_status(self, tag: str, timeout: int = 30) -> tuple[bool | None, str]:
+        """Probe Claude and render a Telegram-ready status line.
+
+        Returns (available, html_status). `available` is None when the outcome is
+        unknown (timeout / launch failure) rather than a definitive yes or no.
+        """
+        print(f"[{tag}] Checking Claude availability: {' '.join(_PROBE_CMD)}", flush=True)
+        try:
+            result = self._run_probe(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            print(f"[{tag}] Claude timed out", flush=True)
+            return None, "⏳ Claude Code <b>timed out</b> (may be rate-limited)."
+        except Exception as e:
+            print(f"[{tag}] Check failed: {e}", flush=True)
+            return None, f"❌ Error checking: {str(e)[:200]}"
+
+        if result.returncode == 0:
+            print(f"[{tag}] Claude is available (exit=0)", flush=True)
+            return True, "✅ Claude Code is <b>available</b>!"
+        print(f"[{tag}] Claude unavailable (exit={result.returncode})", flush=True)
+        stderr = (result.stderr or "").strip()[:300]
+        return False, f"⏳ Claude Code <b>unavailable</b>.\n<code>{stderr}</code>"
 
     # -- /context (one-shot) ----------------------------------------------
 
     def _cmd_context(self):
         """Check if Claude Code is available (not rate-limited)."""
-        print("[context] Checking Claude availability: claude --print -p 'Reply with exactly: ok'", flush=True)
         self.send("🔍 Checking Claude Code availability...")
-
-        def check():
-            try:
-                env = {**os.environ}
-                env.pop("CLAUDECODE", None)
-                result = subprocess.run(
-                    ["claude", "--print", "--output-format", "json", "--max-turns", "1",
-                     "-p", "Reply with exactly: ok"],
-                    capture_output=True, text=True, timeout=30,
-                    cwd=self._project_dir, env=env,
-                )
-                if result.returncode == 0:
-                    print("[context] Claude is available (exit=0)", flush=True)
-                    self.send("✅ Claude Code is available!")
-                else:
-                    print(f"[context] Claude unavailable (exit={result.returncode})", flush=True)
-                    stderr = (result.stderr or "").strip()[:300]
-                    self.send(f"⏳ Claude Code unavailable.\n<code>{stderr}</code>")
-            except subprocess.TimeoutExpired:
-                print("[context] Claude timed out", flush=True)
-                self.send("⏳ Claude Code timed out (may be rate-limited).")
-            except Exception as e:
-                print(f"[context] Check failed: {e}", flush=True)
-                self.send(f"❌ Error checking: {str(e)[:200]}")
-
-        threading.Thread(target=check, daemon=True).start()
+        threading.Thread(
+            target=lambda: self.send(self._probe_status("context")[1]),
+            daemon=True,
+        ).start()
 
     # -- short-lived context polling --------------------------------------
 
@@ -69,25 +92,11 @@ class AvailabilityMixin:
                 time.sleep(poll_interval)
                 if not self._context_polling:
                     break
-                try:
-                    print("[poll] Checking Claude availability: claude --print -p 'Reply with exactly: ok'", flush=True)
-                    env = {**os.environ}
-                    env.pop("CLAUDECODE", None)
-                    result = subprocess.run(
-                        ["claude", "--print", "--output-format", "json", "--max-turns", "1",
-                         "-p", "Reply with exactly: ok"],
-                        capture_output=True, text=True, timeout=30,
-                        cwd=self._project_dir, env=env,
-                    )
-                    if result.returncode == 0:
-                        print("[poll] Claude is back online!", flush=True)
-                        self.send("🟢 <b>Claude Code is back online!</b> You can send messages now.")
-                        self._context_polling = False
-                        break
-                    else:
-                        print(f"[poll] Still unavailable (exit={result.returncode})", flush=True)
-                except Exception as e:
-                    print(f"[poll] Check failed: {e}", flush=True)
+                available, _status = self._probe_status("poll")
+                if available:
+                    print("[poll] Claude is back online!", flush=True)
+                    self.send("🟢 <b>Claude Code is back online!</b> You can send messages now.")
+                    break
 
             self._context_polling = False
             self._context_poll_thread = None
@@ -98,6 +107,7 @@ class AvailabilityMixin:
     # -- long-lived usage-limit watcher -----------------------------------
 
     def _watcher_cleanup_session(self, session_id: str):
+        """Delete the throwaway session transcript the probe just created."""
         if not session_id:
             return
         root = Path.home() / ".claude" / "projects"
@@ -110,25 +120,71 @@ class AvailabilityMixin:
                 pass
 
     def _watcher_parse_reset(self, text: str) -> str:
-        """Extract reset time from Claude's limit message, e.g. 'resets 6:50pm (Asia/Jerusalem)'."""
-        m = re.search(r"resets?\s+([0-9:apm\s]+(?:\([^)]+\))?)", text, re.IGNORECASE)
-        return m.group(1).strip() if m else ""
+        """Extract reset hint from Claude's limit message.
 
-    def _watcher_probe(self) -> tuple[bool, str, str]:
-        """Single probe. Returns (blocked, reset_hint, snippet)."""
+        Handles both 5-hour ('resets 6:50pm (Asia/Jerusalem)') and weekly
+        ('resets May 13 6:50pm', 'resets Wednesday 6:50pm') forms by capturing
+        everything after 'resets' up to a sentence terminator.
+        """
+        m = re.search(r"resets?\s+([^.\n;|]+)", text, re.IGNORECASE)
+        if not m:
+            return ""
+        hint = m.group(1).strip().rstrip(",")
+        return hint[:80]
+
+    def _watcher_seconds_until_reset(self, hint: str) -> int | None:
+        """Parse a clock time out of the hint into seconds-from-now.
+
+        Searches rather than anchors, so weekly hints ('Wednesday 6:50pm') still
+        yield a time. A weekday/date prefix is ignored: worst case we wake early,
+        re-probe, and recompute. Returns None if no clock time is present.
+        """
+        if not hint:
+            return None
+        m = re.search(
+            r"(\d{1,2})(?::(\d{2}))?\s*([apAP][mM])\s*(?:\(([^)]+)\))?",
+            hint.strip(),
+        )
+        if not m:
+            return None
+        hour = int(m.group(1))
+        minute = int(m.group(2) or 0)
+        ampm = m.group(3).lower()
+        tzname = (m.group(4) or "").strip()
+
+        if hour > 12:
+            return None
+        if ampm == "pm" and hour < 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+
+        tz = None
+        if tzname and ZoneInfo is not None:
+            try:
+                tz = ZoneInfo(tzname)
+            except Exception:
+                tz = None
+
+        now = datetime.now(tz) if tz else datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        return int((target - now).total_seconds())
+
+    def _watcher_probe(self) -> tuple[bool | None, str, str]:
+        """Single probe. Returns (blocked, reset_hint, snippet).
+
+        `blocked` is None when the probe could not determine anything (timeout or
+        launch failure). Callers must not treat that as "available" — doing so
+        fires a false "limit reset" ping on every flaky probe.
+        """
         try:
-            env = {**os.environ}
-            env.pop("CLAUDECODE", None)
-            r = subprocess.run(
-                ["claude", "--print", "--output-format", "json", "--max-turns", "1",
-                 "--model", "haiku", "-p", "hi"],
-                capture_output=True, text=True, timeout=60,
-                cwd=self._project_dir, env=env,
-            )
+            r = self._run_probe(timeout=60)
         except subprocess.TimeoutExpired:
-            return False, "", "timeout"
+            return None, "", "timeout"
         except Exception as e:
-            return False, "", f"err: {e!r}"
+            return None, "", f"err: {e!r}"
 
         session_id = ""
         api_err = None
@@ -161,43 +217,51 @@ class AvailabilityMixin:
             return
         self._watcher_enabled = True
         self._watcher_prev_blocked = None
+        self._watcher_wake.clear()
         self._persist_watcher_state(True)
         print("[watcher] started (60m free / 15m blocked)", flush=True)
 
         def loop():
-            interval_blocked = 15 * 60
             interval_free = 60 * 60
-            last_reset_hint = ""
+            fallback_blocked = 15 * 60
+            retry_unknown = 5 * 60  # probe failed — retry soon, state unchanged
+            grace = 60  # seconds after reset before re-probing
+
             while self._watcher_enabled:
-                try:
-                    blocked, reset_hint, snippet = self._watcher_probe()
-                    state = "rate-limited" if blocked else "available"
-                    print(f"[watcher] {state}: {snippet}", flush=True)
+                blocked, reset_hint, snippet = self._watcher_probe()
+                state = {True: "rate-limited", False: "available", None: "unknown"}[blocked]
+                print(f"[watcher] {state}: {snippet}", flush=True)
 
-                    if blocked and self._watcher_prev_blocked is not True:
-                        msg = "🛑 <b>Claude usage limit reached</b> (rate-limited)."
-                        if reset_hint:
-                            msg += f"\n⏰ Resets: <b>{reset_hint}</b>"
-                        msg += "\n🔁 Polling every 15m until the window resets."
-                        self.send(msg)
-                        last_reset_hint = reset_hint
+                if blocked is True and self._watcher_prev_blocked is not True:
+                    msg = "🛑 <b>Claude usage limit reached</b> (rate-limited)."
+                    if reset_hint:
+                        msg += f"\n⏰ Resets: <b>{reset_hint}</b>"
+                    msg += "\nI'll notify you when it resets."
+                    self.send(msg)
+                    self._watcher_last_reset_hint = reset_hint
+                elif blocked is False and self._watcher_prev_blocked is True:
+                    msg = "🟢 <b>Usage limit reset</b> — Claude is available again."
+                    if self._watcher_last_reset_hint:
+                        msg += f"\n<i>(was: resets {self._watcher_last_reset_hint})</i>"
+                    self.send(msg)
+                    print("[watcher] notified rate-limited -> available", flush=True)
+                    self._watcher_last_reset_hint = ""
 
-                    if self._watcher_prev_blocked is True and not blocked:
-                        msg = "🟢 <b>Usage limit reset</b> — Claude is available again."
-                        if last_reset_hint:
-                            msg += f"\n<i>(was: resets {last_reset_hint})</i>"
-                        self.send(msg)
-                        print("[watcher] notified rate-limited -> available", flush=True)
-                        last_reset_hint = ""
-
+                if blocked is not None:
                     self._watcher_prev_blocked = blocked
-                except Exception as e:
-                    print(f"[watcher] probe error: {e!r}", flush=True)
-                wait = interval_blocked if self._watcher_prev_blocked else interval_free
-                slept = 0
-                while self._watcher_enabled and slept < wait:
-                    time.sleep(5)
-                    slept += 5
+
+                # Next sleep: unknown -> short retry, free -> 60m, blocked ->
+                # until the parsed reset time (else a 15m fallback poll).
+                if blocked is None:
+                    wait = retry_unknown
+                elif not blocked:
+                    wait = interval_free
+                else:
+                    secs = self._watcher_seconds_until_reset(reset_hint or self._watcher_last_reset_hint)
+                    wait = (secs + grace) if secs is not None else fallback_blocked
+                print(f"[watcher] next probe in {wait}s", flush=True)
+                self._watcher_wake.wait(wait)  # returns early when the watcher is stopped
+
             print("[watcher] stopped", flush=True)
             self._watcher_thread = None
 
@@ -206,4 +270,5 @@ class AvailabilityMixin:
 
     def _stop_watcher(self):
         self._watcher_enabled = False
+        self._watcher_wake.set()  # break the sleep immediately
         self._persist_watcher_state(False)

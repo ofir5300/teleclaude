@@ -12,22 +12,23 @@ Implementation is split across mixins for readability:
     _voice.py           — Voice → Whisper → Claude
 """
 
-import logging
 import os
+import re
 import threading
+from collections import deque
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from teleclaude._availability import AvailabilityMixin
 from teleclaude._claude_menu import ClaudeMenuMixin
 from teleclaude._claude_runner import ClaudeRunnerMixin
 from teleclaude._polling import PollingMixin
-from teleclaude._telegram import TelegramMixin
+from teleclaude._telegram import TelegramMixin, _request_with_retry
 from teleclaude._voice import VoiceMixin
-from teleclaude.session_cli import ClaudeSession
 from teleclaude.self_update import restart
+from teleclaude.session_cli import ClaudeSession
 
-log = logging.getLogger(__name__)
+SEEN_UPDATE_IDS_MAX = 200
 
 
 class TeleClaudeBot(
@@ -72,7 +73,10 @@ class TeleClaudeBot(
         self.base_url = f"https://api.telegram.org/bot{self.token}"
         self.last_update_id = 0
         self.running = False
-        self._seen_update_ids: set[int] = set()  # dedup Telegram re-deliveries
+        # Dedup Telegram re-deliveries. Set for O(1) lookup, deque for O(1) eviction
+        # of the oldest id once the window is full.
+        self._seen_update_ids: set[int] = set()
+        self._seen_update_order: deque[int] = deque(maxlen=SEEN_UPDATE_IDS_MAX)
 
         self._last_message_text = ""
         self._project_dir = project_dir or str(Path.cwd())
@@ -87,12 +91,16 @@ class TeleClaudeBot(
         self._context_poll_thread = None
 
         # Continuous availability watcher (toggleable from /claude menu).
-        # Probes every 60m while free, 15m while blocked; alerts on blocked->free transitions.
-        # Toggle state persists across restarts via ~/.teleclaude/watcher_enabled.
-        self._watcher_state_file = Path.home() / ".teleclaude" / "watcher_enabled"
+        # Alerts on rate-limited -> available transitions; persists across restarts.
+        # State is scoped per chat_id so multiple teleclaude bots on the same machine
+        # don't share toggle state, double-probe the API, or send duplicate pings.
+        _scope = re.sub(r"[^A-Za-z0-9_-]", "_", str(self.chat_id) or "default")
+        self._watcher_state_file = Path.home() / ".teleclaude" / f"watcher_{_scope}"
         self._watcher_enabled = False
         self._watcher_thread = None
         self._watcher_prev_blocked: bool | None = None
+        self._watcher_last_reset_hint: str = ""
+        self._watcher_wake = threading.Event()  # set to interrupt the watcher's sleep
         if self._watcher_state_file.exists():
             try:
                 if self._watcher_state_file.read_text().strip() == "1":
@@ -186,14 +194,14 @@ class TeleClaudeBot(
         # the same callback is redelivered, and the bot enters an infinite
         # restart loop under any supervisor that respawns the process.
         try:
-            import requests as _r
-            _r.get(
-                self.base_url + "/getUpdates",
+            _request_with_retry(
+                "GET",
+                f"{self.base_url}/getUpdates",
                 params={"offset": self.last_update_id + 1, "timeout": 0},
                 timeout=5,
             )
-        except Exception as _e:
-            print(f"[!] pre-restart Telegram ack failed: {_e}")
+        except Exception as e:
+            print(f"[!] pre-restart Telegram ack failed: {e}", flush=True)
         self.on_restart()
 
     def _cmd_session(self):

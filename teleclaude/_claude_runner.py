@@ -30,7 +30,7 @@ class ClaudeRunnerMixin:
             parts.append(f"📊 {pct:.0f}% {arrow}{peak_str}{est_str}")
         footer = "\n\n<i>" + " · ".join(parts) + "</i>"
         if pct is not None and pct > 85:
-            footer += "\n⚠️ <i>Context {:.0f}% full — consider flushing session</i>".format(pct)
+            footer += f"\n⚠️ <i>Context {pct:.0f}% full — consider flushing session</i>"
         if s.last_compaction_from > 0:
             footer += f"\n🔄 <i>Context was auto-compacted ({s.last_compaction_from:.0f}% → {pct:.0f}%)</i>"
             s.last_compaction_from = 0.0
@@ -105,7 +105,7 @@ class ClaudeRunnerMixin:
         prompt = self._claude_pending_prompt
         self._claude_pending_prompt = None
         self._claude_busy = True
-        print(f"[claude] Approved — implementing (edit mode)", flush=True)
+        print("[claude] Approved — implementing (edit mode)", flush=True)
         self.send("⚡ Implementing... Claude is writing code now.")
 
         def run_implementation():

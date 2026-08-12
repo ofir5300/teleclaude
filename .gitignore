@@ -12,6 +12,10 @@ build/
 .venv/
 venv/
 
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+
 # Runtime
 *.pid
 logs/
@@ -20,6 +24,7 @@ state.json
 # Claude Code session artifacts
 .claude/last_session.md
 logs/claude_session.txt
+.handoff.md
 
 # IDE
 .vscode/
