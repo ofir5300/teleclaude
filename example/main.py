@@ -11,7 +11,9 @@ message routing on top of the built-in Claude Code integration.
 
 import os
 import subprocess
+
 from dotenv import load_dotenv
+
 from teleclaude import ClaudeSession, TeleClaudeBot, kill_previous
 
 load_dotenv()

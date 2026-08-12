@@ -16,8 +16,8 @@ import os
 import re
 import threading
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from teleclaude._availability import AvailabilityMixin
 from teleclaude._claude_menu import ClaudeMenuMixin
@@ -25,8 +25,8 @@ from teleclaude._claude_runner import ClaudeRunnerMixin
 from teleclaude._polling import PollingMixin
 from teleclaude._telegram import TelegramMixin, _request_with_retry
 from teleclaude._voice import VoiceMixin
-from teleclaude.session_cli import ClaudeSession
 from teleclaude.self_update import restart
+from teleclaude.session_cli import ClaudeSession
 
 SEEN_UPDATE_IDS_MAX = 200
 

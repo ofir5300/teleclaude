@@ -10,8 +10,8 @@ import json
 import logging
 import os
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ class ClaudeSession:
         auto_pin: bool = True,
         session_name_prefix: str | None = None,
         bootstrap_file: str | None = None,
-        on_session_fallback: Optional[Callable[[str], None]] = None,
+        on_session_fallback: Callable[[str], None] | None = None,
         plan_tools: list[str] | None = None,
         edit_tools: list[str] | None = None,
         plan_max_turns: int = 25,

@@ -3,7 +3,6 @@
 import html as _html
 import json
 import time
-from typing import Optional
 
 _TG_MAX_LEN = 4000
 
@@ -110,7 +109,7 @@ class TelegramMixin:
                 ok = False
         return ok
 
-    def send_with_markup(self, message: str, reply_markup: dict) -> Optional[int]:
+    def send_with_markup(self, message: str, reply_markup: dict) -> int | None:
         """Send a message with an inline keyboard. Returns message_id on success."""
         if not self.is_configured:
             return None

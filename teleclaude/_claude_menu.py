@@ -124,7 +124,7 @@ class ClaudeMenuMixin:
 
         s = self.claude.stats
         if s.total_turns > 0:
-            msg += f"\n<b>📊 Session Stats</b>\n"
+            msg += "\n<b>📊 Session Stats</b>\n"
             msg += f"🔄 Turns: {s.total_turns}\n"
             msg += f"💰 Cost: ${s.total_cost_usd:.4f}\n"
             msg += f"⏱ Duration: {s.total_duration_ms / 1000:.1f}s\n"
@@ -132,7 +132,7 @@ class ClaudeMenuMixin:
             msg += f"💾 Cache: {s.total_cache_read_tokens:,} read / {s.total_cache_creation_tokens:,} created\n"
             pct = self.claude.context_pct
             if pct is not None:
-                msg += f"\n<b>📊 Context Window</b>\n"
+                msg += "\n<b>📊 Context Window</b>\n"
                 filled = int(pct / 10)
                 bar = "█" * filled + "░" * (10 - filled)
                 warn = " ⚠️" if pct > 80 else ""
@@ -158,7 +158,7 @@ class ClaudeMenuMixin:
                             time_str = f" ≈ {time_left}s"
                     msg += f"└ Remaining: ~{est} turns{time_str}\n"
                 elif pct > 80:
-                    msg += f"└ ⚠️ Consider flushing session\n"
+                    msg += "└ ⚠️ Consider flushing session\n"
 
         msg += "\n<i>To pin a new session, send:</i>\n<code>/session pin &lt;session_id&gt;</code>"
 
